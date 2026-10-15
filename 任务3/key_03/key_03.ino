@@ -1,0 +1,649 @@
+/* ============================================================================
+ *  机械臂考核 —— 任务三（按键板端 · Uno 版）：四按键 → 串口发指令
+ *  文件：key_03.ino              板子：Arduino Uno（第二块，专职读按键）
+ *
+ *  【接线（配套主控板 total_123）】
+ *      UNO D2 / D3 / D4 / D5  <--  按键 1 / 2 / 3 / 4
+ *                                  （每个键另一端接 GND；内部上拉，不接电阻）
+ *      UNO GND                <--> 主控 GND      ← 必须共地，所有板子同一个 GND
+ *      UNO D7（软串口 TX）     ---> 主控 D10（软串口 RX）  ← 按键指令走这根线
+ *
+ *      ★ 主控侧必须是 total_123 里"从 D10 收"的这一版；
+ *        若主控改成硬件串口接收，则改接主控 D0（见文件末尾说明）。
+ *
+ *  ==========================================================================
+ *  【这块板子要干的事，就一句话】
+ *    人手按一下按键 → 通过串口给主控 Uno 发一个字符 → 主控做对应动作。
+ *
+ *      按键 1（循环执行）  →   '1'   →   循环夹取 A / B / C
+ *      按键 2（录制）      →   '2'   →   录制 开始 / 结束（同一键切换）
+ *      按键 3（播放）      →   '3'   →   回放上一次录制的动作
+ *      按键 4（回中）      →   '4'   →   平滑回到初始位置
+ *
+ *  ==========================================================================
+ *  【★ 本次新增：接线自检工具】
+ *    这块板子用 USB 插在电脑上时，打开它的串口监视器（9600），
+ *    敲一个字母回车就能用：
+ *        t  ->  按键接线自检：一步步提示你按每个键，最后给"通过 n / 4"
+ *        w  ->  实时电平监视：按住某个键，看它到底接在哪个 D 号上
+ *        s  ->  联机测试：往主控发测试字符，检查 D7->D10 这根线和共地
+ *        i  ->  再看一遍静态电平
+ *        h  ->  命令列表
+ *    → 实现在【第 7 部分】，那里写了"为什么要有这三个工具"。
+ *
+ *  ★ 按键板就用这块 Arduino 成品板：通信协议、按键逻辑、波特率
+ *    和主控那边**完全一样**。主控烧好之后，这边一行代码都不用改。
+ * ==========================================================================*/
+
+
+/* ============================================================================
+ *  【第 1 部分】引脚配置（要改就改这里）
+ * --------------------------------------------------------------------------
+ *  这块 Uno 是"专职按键板"：上面不叠拓展板、不接舵机、不接摇杆，
+ *  所以 D2~D12 几乎全都空着，随便挑。
+ *
+ *  ★ 唯独 D0 / D1 绝对不能用：那是硬件串口，已经被 USB 占用了
+ *    （留着在电脑上看调试信息）。接上去会导致烧录失败 / 串口乱码。
+ *  ★ D13 上有一盏板载 LED，接按键也能用，但每按一次灯会闪一下，
+ *    而且 LED 电路会分走一点电流，没必要，避开就好。
+ * ==========================================================================*/
+const int KEY_PIN_1 = 2;     // 按键 1：循环夹取   → 发 '1'
+const int KEY_PIN_2 = 3;     // 按键 2：录制开/关  → 发 '2'
+const int KEY_PIN_3 = 4;     // 按键 3：播放       → 发 '3'
+const int KEY_PIN_4 = 5;     // 按键 4：回中       → 发 '4'
+
+const int TX_TO_MAIN = 7;    // 发给主控 Uno 的信号脚 → 接主控的 D10
+
+
+/* ============================================================================
+ *  【第 2 部分】引库与串口对象
+ * ==========================================================================*/
+#include <SoftwareSerial.h>
+
+/*  ★★ 为什么要用 SoftwareSerial 另开一路串口，而不是直接用 Serial？★★
+ *    Uno 只有一路硬件串口（D0/D1），已经被 USB 占用了 ——
+ *    我们要留着它在电脑上看调试信息（按一下键打印一行，方便排查）。
+ *    所以另开一路"软串口"专门跟主控 Uno 说话。
+ *
+ *  ★ 构造函数参数是 (RX脚, TX脚)。本程序**只发送、不接收**，
+ *    所以第一个参数给一个空脚 D8 凑数，实际不接任何线。
+ *    ★ 为什么不写 -1 表示"不要 RX"？
+ *      AVR 上的 SoftwareSerial 不保证支持传 -1，
+ *      传一个真实存在的空脚最保险 —— 反正不接线，不花任何代价。
+ *
+ *  ★ 软串口的原理是"软件模拟"：靠定时器中断一位一位地把电平时序挪出去。
+ *    发送时会短暂占用 CPU，但 9600 波特率发一个字节只要约 1ms，
+ *    人按一次键才发一次，完全不影响按键扫描。
+ *    而且**发送**比**接收**温和得多 —— 接收要关全局中断，发送不用，
+ *    所以本程序不会像主控那边那样跟舵机库抢中断。 */
+SoftwareSerial mainSerial(8, 7);
+
+
+/* ============================================================================
+ *  【第 3 部分】参数
+ * ==========================================================================*/
+const long BAUD_MAIN  = 9600;   // 与主控 Uno 通信的波特率
+                                //   ★ 必须和主控那边 arduinoSerial.begin() 写的一致，
+                                //     不一致收到的就是一堆乱码（这是最常见的联调故障）
+const long BAUD_DEBUG = 9600;   // 与电脑 USB 的调试串口波特率
+                                //   ★ 打开串口监视器时要选 9600
+
+
+
+/* ============================================================================
+ *  【第 4 部分】按键状态（做"边沿触发"用）
+ * ==========================================================================*/
+int last1 = HIGH;    // 上一次读到的电平，HIGH = 松开
+int last2 = HIGH;
+int last3 = HIGH;
+int last4 = HIGH;
+
+
+/* ---- ★ 诊断工具的状态（本次新增，实现在【第 7 部分】）----
+ *  ★ 这两个变量为什么定义在这里，而不是和第 7 部分的函数放在一起？
+ *    因为 loop() 里要用到它们。C++ 的规矩是"先声明后使用"，
+ *    变量写在函数后面，前面的代码就看不到它。
+ *    （函数没关系——函数原型在前面声明过就行了，这也是【第 5 部分】
+ *      专门列一遍原型的原因。） */
+bool watchMode = false;      // w 命令：实时电平监视开关
+bool testAbort = false;      // 自检过程中发 q 回车可以中断
+
+
+/* ============================================================================
+ *  【第 5 部分】函数原型
+ * ==========================================================================*/
+void sendKey(char c);
+void scanOneKey(int pin, char keyChar, int &lastState, const char* label);
+
+/* ---- 自检工具的函数原型（实现在【第 7 部分】）---- */
+void handleSerialCmds();
+void printDiagHelp();
+void reportPin(const __FlashStringHelper* name, int pin);
+void printIdleState();
+void runSelfTest();
+bool testOneButton(int pin, const __FlashStringHelper* name);
+bool waitForLevel(int pin, int want, unsigned long timeoutMs);
+bool idleWait(unsigned long ms);
+void watchInit();
+void watchPins();
+void reportWatch(const __FlashStringHelper* name, int from, int to);
+void sendLinkTest();
+
+
+/* ============================================================================
+ *  setup() —— 开机只跑一次
+ * ==========================================================================*/
+void setup(){
+  /* ---- 1. 四个按键引脚：内部上拉输入 ----
+   * ★ 用 INPUT_PULLUP 而不是普通 INPUT，是为了省掉 4 个外部上拉电阻。
+   *   ATmega328P 每个 IO 口内部都有一个可编程上拉电阻（约 20~50kΩ），
+   *   打开之后：不按键时引脚被拉到高电平（读到 1），
+   *             一按键引脚被直接接到 GND（读到 0）。
+   *   面包板上少 4 个电阻 4 根线，好搭很多，也不容易接错。 */
+  pinMode(KEY_PIN_1, INPUT_PULLUP);
+  pinMode(KEY_PIN_2, INPUT_PULLUP);
+  pinMode(KEY_PIN_3, INPUT_PULLUP);
+  pinMode(KEY_PIN_4, INPUT_PULLUP);
+
+  /* ---- 2. 调试串口（电脑 USB）----
+   * ★ 这路串口只给自己看，跟主控 Uno 无关。
+   *   它的用处：当你按了键但主控没反应时，先看这里有没有打印 ——
+   *   有打印说明"按键 + 按键板"这一段是好的，问题一定出在
+   *   "两块板子之间的连线上"（90% 是没共地）。
+   *   这样一排查就把问题一刀切成两半，特别省时间。 */
+  Serial.begin(BAUD_DEBUG);
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("Task3 Uno keypad ready."));
+  Serial.println(F("  D2 = key1 cycle    D3 = key2 record"));
+  Serial.println(F("  D4 = key3 play     D5 = key4 home"));
+  Serial.println(F("  TX(D7) -> main Uno D10    GND - GND !!!"));
+  Serial.println(F("  (send h here for self-test commands)"));
+  Serial.println(F("================================"));
+
+  /* ---- 3. 与主控 Uno 通信的软串口 ---- */
+  mainSerial.begin(BAUD_MAIN);
+
+  /* ---- 4. 上电自检：读一遍四个按键的电平 ----
+   * ★ 为什么要自检？如果某个按键的线接错了（比如接到了 VCC，
+   *   或者按键本身就是坏的常闭），上电读到的是 LOW，
+   *   程序就会"以为按键一直被按着"，表现是刚开机机械臂自己就动了。
+   *   这里调用 printIdleState()，它会一条条打印并标出 OK / 异常。
+   * ★ 注意：上电只能查"没按的时候对不对"，
+   *   查不了"按下去通不通"——那要用命令 t 做完整自检（见【第 7 部分】）。 */
+  printIdleState();
+  Serial.println(F("+ 想看诊断命令列表：发 h 回车。"));
+}
+
+
+/* ============================================================================
+ *  loop() —— 主循环
+ * ==========================================================================*/
+void loop(){
+  /* ---- ① 先看电脑串口有没有发来诊断命令（t / w / s / i / h）----
+   * ★ 只在"电脑插着这块板做调试"时才有输入，正常演示时不会有影响。 */
+  handleSerialCmds();
+
+  /* ---- ② 监视模式：只读电平、报变化，**不发指令** ----
+   * ★ 为什么这里要单独一条分支、不走下面的 scanOneKey()？
+   *   因为扫线的目标是"看清电平"，不是"触发动作"。
+   *   如果监视时还照常往主控发指令，你测一次线机械臂就在边上动一次，
+   *   既吓人又可能撞到东西。所以监视模式下只读数，不发送。 */
+  if (watchMode) {
+    watchPins();
+    return;
+  }
+
+  /* ---- ③ 正常模式：四个按键各扫一遍 ----
+   * 四个按键各扫一遍。
+   * ★ 这里抽成 scanOneKey() 函数，而不是把同样的代码抄四遍 ——
+   *   四个按键的逻辑完全一样，抄四遍的话以后想改引脚就要改四处，
+   *   很容易漏掉一个。
+   * ★ 本循环里**没有任何 delay()**，一圈跑完只要几十微秒，
+   *   所以按键响应永远是"一按就有"，不会漏按。 */
+  scanOneKey(KEY_PIN_1, '1', last1, "key1 cycle pick");
+  scanOneKey(KEY_PIN_2, '2', last2, "key2 record");
+  scanOneKey(KEY_PIN_3, '3', last3, "key3 play");
+  scanOneKey(KEY_PIN_4, '4', last4, "key4 home");
+}
+
+
+/* ============================================================================
+ *  【第 6 部分】按键扫描与发送
+ * ==========================================================================*/
+
+/*  scanOneKey() —— 扫描一个按键，检测到"刚按下"就发对应字符
+ *
+ *    参数 pin       ：按键接的引脚
+ *    参数 keyChar   ：要发给主控的字符
+ *    参数 lastState ：★ 引用传递，记住"上一次读到的电平"
+ *    参数 label     ：打印用的名字
+ *
+ *    【★ 为什么这个参数必须用引用（&）？】
+ *      函数里改 lastState，必须改到调用方那个变量**本身**，
+ *      而不是它的副本。不加 & 的话函数里改完就丢了，
+ *      结果就是"从第二次开始永远不触发"。
+ *      这是 C++ 里引用最常见的用途，也是个常见坑。
+ *
+ *    【★ 边沿触发 vs 电平触发 —— 这个区别很重要】
+ *      本函数用的是**边沿触发**：
+ *          条件 = "现在读到 LOW（按下）且 上一次是 HIGH（松开）"
+ *          → 只在"从松开变成按下"的那一瞬间触发一次
+ *      如果用电平触发（只要读到 LOW 就触发），按住不放就会一直触发：
+ *      按住按键 1 会让机械臂不停地循环夹取，根本没法用。
+ */
+void scanOneKey(int pin, char keyChar, int &lastState, const char* label){
+  int cur = digitalRead(pin);
+
+  /* 两个条件都要满足：
+   *   ① 现在读到 LOW     —— 按键被按下
+   *   ② 上一次读到 HIGH  —— 才说明是"刚按下"这个瞬间 */
+  if (cur == LOW && lastState == HIGH) {
+    Serial.print(F("+ "));
+    Serial.print(label);
+    Serial.print(F("  ->  send '"));
+    Serial.print(keyChar);
+    Serial.println(F("'"));
+
+    sendKey(keyChar);
+  }
+
+  lastState = cur;   // ★ 一定要把本次电平存回去，下次比较用。
+                     //   漏了这一步，按键就只会触发一次，之后再也不响应。
+}
+
+/*  sendKey() —— 把字符发给主控 Uno
+ *
+ *    ★ 用 write() 而不是 print()：
+ *      print(1) 会先把数字转成字符串再发（碰巧也是 '1'，但多绕一步）；
+ *      write('1') 的语义是明确的"我就发这一个字节"，
+ *      而且不会附加任何东西（print 对某些类型会带换行）。
+ *      串口协议要的就是"一个字节 = 一条指令"，用 write 最不容易出岔子。
+ */
+void sendKey(char c){
+  mainSerial.write(c);
+}
+
+
+/* ============================================================================
+ *  【第 7 部分】★ 接线自检与诊断工具（本次新增）
+ * ----------------------------------------------------------------------------
+ *  【为什么需要这一部分？】
+ *    "按键按了没反应"这一个现象，背后至少有 5 种完全不同的原因：
+ *      ① 按键的另一端忘了接到 GND              ← 最常见，占一半以上
+ *      ② 面包板那一列 / 那一排内部不通，或者杜邦线内部断了
+ *      ③ 这根线其实插在了别的 D 号上（引脚搞错了）
+ *      ④ D7 -> 主控 D10 这根信号线没接好
+ *      ⑤ 两块板忘了共地
+ *    没有工具的时候只能"拆了重接一遍再试"，非常低效，而且不知道到底错在哪。
+ *    下面三个命令正好把这 5 种原因一一区分开：
+ *
+ *      t  —— 按键接线自检（引导式）
+ *            逐条提示"请按住 key1"，你按对了它报 PASS；6 秒内没读到按下
+ *            就报 FAIL，并列出最可能的原因。全部走完给"通过 n / 4"。
+ *      w  —— 实时电平监视（开 / 关）
+ *            打开后按住任意一个键，串口会打印它到底接在哪个 D 号上：
+ *              D2 key1 cycle  : 1 -> 0   [按下]
+ *            专门用来抓"我明明接的是 D3，按它怎么没反应"这种情况。
+ *            ★ 监视模式下**不会**往主控发指令，机械臂不会动，可以放心测。
+ *      s  —— 联机测试
+ *            往主控发 5 个测试字符 '?'，然后你去看【主控那块板】的串口
+ *            监视器，应该出现 5 行 "+LINK OK (from keypad)"。
+ *            看不到就是 D7->D10 这根线或者共地的问题。
+ *
+ *  【怎么用】打开这块板自己的串口监视器（波特率 9600），敲字母回车。
+ *
+ *  【★ 实现上要注意的两点】
+ *    1) 所有固定的中文提示句都套了 F()，让字符串留在 Flash 里。
+ *       AVR 的 RAM 只有 2KB，中文一个字占 3 字节，不套 F() 很容易吃光
+ *       （这个项目早期就真的吃过——128 条提示把 RAM 顶到 140%）。
+ *    2) 传"引脚名字"给函数时，参数类型写成 const __FlashStringHelper*
+ *       （就是 F() 返回的类型），这样调用处可以写
+ *           reportPin(F("D2 key1 cycle "), KEY_PIN_1);
+ *       名字依然留在 Flash 里，一个字节 RAM 都不占。
+ *       如果写成 const char* 就不行了 —— 那是"RAM 里的字符串"的类型。
+ * ==========================================================================*/
+
+/*  ★ 两个状态变量 watchMode / testAbort 定义在上面【第 4 部分】，
+ *    因为 loop() 也要用它们。这里只放函数。 */
+
+/*  handleSerialCmds() —— 处理电脑串口发来的命令（都是单字母）
+ *
+ *  ★ 为什么这里"收到一个字符就处理"，不像主控那样攒成一行再处理？
+ *    因为本板的命令全是单个字母，不存在"半条命令"这种情况。
+ *    主控要处理 "b90" 这种带数字的指令，才必须攒行。
+ *    —— 需求决定实现，不是越复杂越好。
+ */
+void handleSerialCmds(){
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r' || c == ' ') continue;   // 换行、空格忽略掉
+
+    switch (c) {
+      case 't': case 'T': runSelfTest(); break;
+
+      case 'w': case 'W':
+        watchMode = !watchMode;                  // 再发一次就关掉
+        if (watchMode) {
+          Serial.println(F(""));
+          Serial.println(F("+ WATCH ON —— 现在按下任意一个按键（或用手碰一下杜邦线），"));
+          Serial.println(F("+ 看串口报出来的那个 D 号是谁。"));
+          Serial.println(F("+ ★ 监视模式下不会往主控发指令，机械臂不会动。"));
+          Serial.println(F("+ 再发一次 w 关闭监视。"));
+          watchInit();
+        } else {
+          Serial.println(F("+ WATCH OFF —— 恢复正常按键功能。"));
+          /* ★ 退出监视时，把"上一次电平"重新读一遍。
+           *   否则监视期间按键状态变了，last1..last4 还停在旧值，
+           *   一回到正常模式就可能立刻触发一次莫名其妙的动作。 */
+          last1 = digitalRead(KEY_PIN_1);
+          last2 = digitalRead(KEY_PIN_2);
+          last3 = digitalRead(KEY_PIN_3);
+          last4 = digitalRead(KEY_PIN_4);
+        }
+        break;
+
+      case 's': case 'S': sendLinkTest();   break;
+      case 'i': case 'I': printIdleState(); break;
+      case 'h': case 'H': printDiagHelp();  break;
+
+      default:
+        Serial.print(F("+Unknown cmd: ")); Serial.println(c);
+        Serial.println(F("+ 可用命令: t=自检  w=实时监视  s=联机测试  i=电平  h=帮助"));
+        break;
+    }
+  }
+}
+
+/*  printDiagHelp() —— 命令列表 */
+void printDiagHelp(){
+  Serial.println(F(""));
+  Serial.println(F("========== 按键板诊断命令（波特率 9600）=========="));
+  Serial.println(F("  t  ->  按键接线自检（引导式，会提示你按每个键）"));
+  Serial.println(F("  w  ->  实时电平监视  开 / 关（按一次开，再按一次关）"));
+  Serial.println(F("  s  ->  联机测试（往主控发 '?'，看主控那边有没有回应）"));
+  Serial.println(F("  i  ->  再看一遍 4 个按键的静态电平"));
+  Serial.println(F("  h  ->  这个帮助"));
+  Serial.println(F("  q  ->  自检进行中发 q 回车可以中断"));
+  Serial.println(F("  ★ 一次按键可能打印好几行重复的，那是金属弹片抖动，正常。"));
+  Serial.println(F("================================================"));
+  Serial.println(F(""));
+}
+
+/*  reportPin() —— 打印一个引脚的静态电平，并判断是否正常
+ *    ★ 参数类型是 const __FlashStringHelper*：
+ *      调用处写 reportPin(F("D2 key1 cycle "), KEY_PIN_1)，
+ *      名字留在 Flash 里，不占 RAM。 */
+void reportPin(const __FlashStringHelper* name, int pin){
+  int v = digitalRead(pin);
+  Serial.print(F("+  "));
+  Serial.print(name);
+  Serial.print(F(" = "));
+  Serial.print(v);
+  Serial.println(v == HIGH ? F("   OK") : F("   <<== 异常！"));
+}
+
+/*  printIdleState() —— 静态电平检查（上电时和发 i 时都会调用） */
+void printIdleState(){
+  Serial.println(F(""));
+  Serial.println(F("+---- 静态电平检查（手不要碰任何按键）----"));
+  reportPin(F("D2 key1 cycle "), KEY_PIN_1);
+  reportPin(F("D3 key2 record"), KEY_PIN_2);
+  reportPin(F("D4 key3 play  "), KEY_PIN_3);
+  reportPin(F("D5 key4 home  "), KEY_PIN_4);
+  Serial.println(F("+  正常应该全是 1。谁出现 0，就是那个键的线接错了"));
+  Serial.println(F("+  （最常见：按键那一脚没经过按键就直接接到了 GND）。"));
+  Serial.println(F("+  注意：静态检查只能证明松开时是对的，"));
+  Serial.println(F("+        证明不了按下去通不通——要查这个请发 t 做完整自检。"));
+  Serial.println(F("+----------------------------------------"));
+}
+
+/*  runSelfTest() —— 引导式按键接线自检
+ *    这是本文件最有用的一个工具：把"接线对不对"变成一个能自己跑的测试。
+ */
+void runSelfTest(){
+  testAbort = false;
+
+  Serial.println(F(""));
+  Serial.println(F("+==================================================+"));
+  Serial.println(F("+     按键接线自检  BUTTON WIRING SELF-TEST"));
+  Serial.println(F("+  跟着提示按对应的按键就行。想中断：发 q 回车。"));
+  Serial.println(F("+==================================================+"));
+
+  printIdleState();
+
+  int pass = 0;
+
+  if (testOneButton(KEY_PIN_1, F("D2   key1 (cycle pick)"))) pass++;
+  if (testAbort) { Serial.println(F("+ 自检被中断。")); return; }
+  if (testOneButton(KEY_PIN_2, F("D3   key2 (record)")))     pass++;
+  if (testAbort) { Serial.println(F("+ 自检被中断。")); return; }
+  if (testOneButton(KEY_PIN_3, F("D4   key3 (play)")))       pass++;
+  if (testAbort) { Serial.println(F("+ 自检被中断。")); return; }
+  if (testOneButton(KEY_PIN_4, F("D5   key4 (home)")))       pass++;
+  if (testAbort) { Serial.println(F("+ 自检被中断。")); return; }
+
+  Serial.println(F(""));
+  Serial.println(F("+============ SELF-TEST RESULT ============"));
+  Serial.print(F("+  通过  "));
+  Serial.print(pass);
+  Serial.println(F(" / 4 个按键"));
+  if (pass == 4) {
+    Serial.println(F("+  [OK] 4 个按键的接线全部正确！"));
+    Serial.println(F("+  接下来检查两块板之间那 2 根线："));
+    Serial.println(F("+     按键板 D7   ->  主控 D10     （信号）"));
+    Serial.println(F("+     按键板 GND  <-> 主控 GND     （★ 必须共地）"));
+    Serial.println(F("+  发 s 回车可以实测这根信号线通不通。"));
+  } else {
+    Serial.println(F("+  [!!] 有按键没通过，按上面列出的原因逐条排查。"));
+    Serial.println(F("+  万能办法：发 w 回车打开实时监视，按住那个不响应的键，"));
+    Serial.println(F("+  看串口报的是哪个 D 号 —— 那就是它真正接的引脚。"));
+  }
+  Serial.println(F("+=========================================="));
+  Serial.println(F(""));
+}
+
+/*  testOneButton() —— 测一个按键，通过返回 true
+ *
+ *  ★ 为什么要"真的按一下"才算通过？因为只读静态电平查不出下面这种错误：
+ *      按键一端接在 D3，另一端也插在面包板上、但没有接到 GND。
+ *      这时松开读到 1（看着正常），按下去还是 1（因为没接地）。
+ *      只有要求"按下必须读到 0"，才能证明按键两端都接对了。
+ *
+ *  ★ 它一共查三件事，正好对应三种典型接错方式：
+ *      ① 松手时是 1    → 不是的话，说明引脚被直接短路到 GND 了
+ *      ② 按下时是 0    → 不是的话，说明"按下"这个动作没传到引脚上
+ *      ③ 松手后又变 1  → 不是的话，说明引脚被常闭短接着（按键坏了）
+ */
+bool testOneButton(int pin, const __FlashStringHelper* name){
+  Serial.println(F(""));
+  Serial.print(F("+---- "));
+  Serial.print(name);
+  Serial.println(F(" ----"));
+
+  /* ---- ① 静态：松手时应该是高电平 ---- */
+  int idle = digitalRead(pin);
+  Serial.print(F("+  松手时的电平 = "));
+  Serial.println(idle);
+  if (idle == LOW) {
+    Serial.println(F("+  [FAIL] 还没按就已经是 0 了！"));
+    Serial.println(F("+    说明这个引脚一直被拉在地线上：要么这根线直接接到了 GND"));
+    Serial.println(F("+    （没经过按键），要么按键是常闭型 / 已经坏了。换个按键试试。"));
+    return false;
+  }
+
+  Serial.println(F("+  请把手放到这个按键上，3 秒后开始检测 ..."));
+  if (!idleWait(3000)) return false;
+
+  /* ---- ② 按下：应该变成低电平 ---- */
+  Serial.print(F("+  >>> 现在按住它，保持 3 秒 ... "));
+  if (!waitForLevel(pin, LOW, 6000)) {
+    Serial.println(F(""));
+    if (testAbort) return false;
+    Serial.println(F("+  [FAIL] 6 秒内一直是 1，没读到过 0。"));
+    Serial.println(F("+    按概率排的原因："));
+    Serial.println(F("+      1) 这个按键的另一端没有接到 GND     <- 最常见"));
+    Serial.println(F("+      2) 面包板那一列是断的，或者杜邦线内部断了"));
+    Serial.println(F("+      3) 这根线其实插在了别的 D 号上"));
+    Serial.println(F("+    排查：发 w 回车打开实时监视，再按住这个键，"));
+    Serial.println(F("+          串口报出来的 D 号就是它真正接的引脚。"));
+    return false;
+  }
+  Serial.println(F("读到 0 了，"));
+
+  /* ---- ③ 松开：应该回到高电平 ---- */
+  Serial.print(F("+  >>> 请松开它 ... "));
+  if (!waitForLevel(pin, HIGH, 3000)) {
+    Serial.println(F(""));
+    if (testAbort) return false;
+    Serial.println(F("+  [FAIL] 松手之后还是 0 —— 这个引脚被一直拉在地线上。"));
+    Serial.println(F("+    常见原因：按键损坏变成常闭，或者这根线短路到 GND 排了。"));
+    return false;
+  }
+  Serial.println(F("回到 1 了。"));
+  Serial.println(F("+  [PASS] 1 --按下--> 0 --松开--> 1，这个键完全正常。"));
+  return true;
+}
+
+/*  waitForLevel() —— 在 timeoutMs 毫秒内等引脚变成 want 电平
+ *    ★ 等待期间还在读串口，所以自检走到一半也能发 q 中断。
+ *      （如果这里图省事写成 delay()，就只能干等它自己超时，很烦。） */
+bool waitForLevel(int pin, int want, unsigned long timeoutMs){
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (digitalRead(pin) == want) return true;
+    if (Serial.available() > 0) {
+      char c = (char)Serial.read();
+      if (c == 'q' || c == 'Q') {
+        testAbort = true;
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+/*  idleWait() —— 纯粹等一段时间，但同样认 q 中断 */
+bool idleWait(unsigned long ms){
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (Serial.available() > 0) {
+      char c = (char)Serial.read();
+      if (c == 'q' || c == 'Q') {
+        testAbort = true;
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/* ---- 实时电平监视（w 命令）----
+ *  ★ 策略是"电平一变就报一行"，而不是每一轮都报。
+ *    每轮都报的话，9600 波特率会被刷屏刷爆，反而什么都看不清。 */
+int wPrev1, wPrev2, wPrev3, wPrev4;
+
+void watchInit(){
+  wPrev1 = digitalRead(KEY_PIN_1);
+  wPrev2 = digitalRead(KEY_PIN_2);
+  wPrev3 = digitalRead(KEY_PIN_3);
+  wPrev4 = digitalRead(KEY_PIN_4);
+  Serial.println(F("+ 已开始监视。按任意键，或者用手碰一下杜邦线试试。"));
+}
+
+void reportWatch(const __FlashStringHelper* name, int from, int to){
+  Serial.print(F("+  "));
+  Serial.print(name);
+  Serial.print(F(" : "));
+  Serial.print(from);
+  Serial.print(F(" -> "));
+  Serial.print(to);
+  Serial.println(to == LOW ? F("   [按下]") : F("   [松开]"));
+}
+
+void watchPins(){
+  int cur;
+
+  cur = digitalRead(KEY_PIN_1);
+  if (cur != wPrev1) { reportWatch(F("D2 key1 cycle "), wPrev1, cur); wPrev1 = cur; }
+
+  cur = digitalRead(KEY_PIN_2);
+  if (cur != wPrev2) { reportWatch(F("D3 key2 record"), wPrev2, cur); wPrev2 = cur; }
+
+  cur = digitalRead(KEY_PIN_3);
+  if (cur != wPrev3) { reportWatch(F("D4 key3 play  "), wPrev3, cur); wPrev3 = cur; }
+
+  cur = digitalRead(KEY_PIN_4);
+  if (cur != wPrev4) { reportWatch(F("D5 key4 home  "), wPrev4, cur); wPrev4 = cur; }
+}
+
+/*  sendLinkTest() —— 联机测试：验证 按键板 -> 主控 那根信号线
+ *
+ *  ★ 为什么发 '?' 这个字符？
+ *    主控的程序里 '1'~'4' 会触发真动作，换行会被静默忽略，
+ *    只有 '?' 是专门留出来的"我只想确认链路通不通"的测试字符 ——
+ *    主控收到 '?' 会打印一行 +LINK OK (from keypad)，但不会动机械臂。
+ *    （见 task3_arduino.ino 的 onKeyChar() 里的 case '?'）
+ */
+void sendLinkTest(){
+  Serial.println(F(""));
+  Serial.println(F("+========= LINK TEST  (按键板 D7 -> 主控 D10) ========="));
+  Serial.println(F("+  现在往主控发 5 个测试字符 '?'。"));
+  Serial.println(F("+  ★ 请去看【主控那块板】的串口监视器（也是 9600）："));
+  Serial.println(F("+     应该出现 5 行  +LINK OK (from keypad)"));
+  Serial.println(F("+"));
+  Serial.println(F("+  怎么判断："));
+  Serial.println(F("+     5 行都有    -> 信号线和共地都正常，链路没问题"));
+  Serial.println(F("+     一行都没有  -> D7->D10 这根线没接好，或者两板忘了共地"));
+  Serial.println(F("+     只有几行    -> 接触不良（面包板、杜邦线很常见），换一根线"));
+  Serial.println(F("+  发送中 ..."));
+
+  for (int i = 0; i < 5; i++) {
+    mainSerial.write('?');
+    Serial.print(F("+    send '?'  "));
+    Serial.println(i + 1);
+    delay(300);
+  }
+
+  Serial.println(F("+  发完了。主控那边看到几行？"));
+  Serial.println(F("+====================================================="));
+  Serial.println(F(""));
+}
+
+
+/* ============================================================================
+ *  【第 8 部分】联调与故障排查（按这个顺序做）
+ * ----------------------------------------------------------------------------
+ *  【第一步：按键板自己先测通（别急着接主控）】
+ *    1) 烧录本程序，打开串口监视器（波特率 9600）
+ *    2) 上电会自动做一次静态电平检查，4 个引脚应该全标 OK
+ *       有谁标了"异常"，说明那个键的线接错了 → 先修接线
+ *    3) ★ 最省事的做法：发 t 回车，让程序带你走一遍完整自检
+ *       （它会提示你按每个键，最后给"通过 n / 4"）
+ *    4) 也可以挨个按四个键，每按一次应该看到一行
+ *          + key1 cycle pick  ->  send '1'
+ *       看不到就发 w 回车打开实时监视，按住那个键，看它接在哪个 D 号上
+ *    5) 全过了再往下走 —— 这样"按键板这一段"就被证明是好的，
+ *       后面接上主控如果没反应，就只可能是"两块板之间那 2 根线"的问题。
+ *
+ *  【第二步：接上主控 Uno】
+ *    1) 接线：按键板 D7 → 主控 D10；★ 两板 GND 相连
+ *    2) 主控烧 task3_arduino.ino，打开主控的串口监视器（9600）
+ *    3) ★ 先发 s 回车做联机测试（不用碰按键就能验整条链路）：
+ *       主控那边应出现 5 行 +LINK OK (from keypad)。
+ *       一行都没有 → 直接去查那 2 根线，跟按键没关系
+ *    4) 再按按键板的键，主控那边应该出现：
+ *          +Arduino key: 1
+ *    5) 收到乱码 → 两边波特率不一致，或者没共地
+ *    6) 完全没反应 → 先晃动一下 D7 那根线（面包板接触不良是常事）；
+ *       再不行就换个空闲引脚重烧两边
+ *
+ *  【第三步：整体验收（对着任务要求逐条演一遍）】
+ *    按键 1 按三次 → 依次夹 A、B、C，第四次又回到 A（循环成立）
+ *    按键 2 按一下 → 主控打印 REC START；用摇杆动 >10 秒；再按一下
+ *                 → 打印录了多少帧、多少秒，并且确认"满足 >10s"
+ *    按键 3 按一下 → 机械臂把刚才那段动作完整重演
+ *    按键 4 按一下 → 平滑回到初始位置
+ *    ★ 演示顺序建议就按 1 → 2 → 3 → 4 这个顺序，正好覆盖任务书的叙述顺序，
+ *      评委看着最顺。
+ * ==========================================================================*/

@@ -1,0 +1,1021 @@
+/* ============================================================================
+ *    借助另一块开发板（专职按键板）搭建与 Arduino 的串口通信。
+ *    按键板负责捕获 4 个按键的输入信号，把对应的控制指令通过串口发过来；
+ *    本板（主控）接收到指令后驱动机械臂执行动作：
+ *      按键 1（10%）循环执行：循环触发任务二的夹取动作（A→B→C 循环）
+ *      按键 2       录制：第一次按下开始录制，人工用摇杆操控 >10 秒；
+ *                       第二次按下结束录制并保存
+ *      按键 3（10%）播放：调取上一次录制的动作并完整复现
+ *      按键 4（5%） 回中：回归初始状态位置
+ *
+ *  ★★ 本文件是 task3_arduino.ino 的"硬件串口直连版" ★★
+ *  --------------------------------------------------------------------------
+ *    【接线改了什么】
+ *      旧版：按键板用软串口，D6(TX) -> 本板 D10(RX)，只发不收。
+ *      新版：D6~D10 那几根线全部去掉，改成两块板的 **硬件串口 RX/TX 对接**：
+ *
+ *          按键板 TX (D1)  ──>  本板 RX (D0)      ← 按键指令从这儿进来
+ *          按键板 RX (D0)  <──  本板 TX (D1)      ← 可选（见下面警告）
+ *          按键板 GND      ───  本板 GND          ← 必须接，不接必乱码
+ *
+ *    【程序上要改的就三处】
+ *      ① 不再需要 SoftwareSerial —— 直接用硬件 Serial 收发。
+ *      ② 原来"软串口一个字符立刻处理 + USB 攒成一行"的两路逻辑，
+ *         现在合并成一路（都从 Serial 来），所以下面 loop() 里
+ *         只留一段读取代码。
+ *      ③ handleSerialLine() 里补上 '?'（按键板的联机测试字符）。
+ *
+ *    【为什么合并成一路后还成立？】
+ *      按键板发过来的是**单个字符**（'1'~'4'、'?'），没有换行。
+ *      本程序的行缓冲有"静默 50ms 就算这行结束了"的规则
+ *      （SERIAL_IDLE_MS），所以单字符到了以后 50ms 就会被当成
+ *      "一行 = 1 个字符"交给 handleSerialLine()，和手动敲 '1' 回车
+ *      走的是同一条路。既不会丢，也不会和 "b90" 这种带数字的
+ *      调试指令打架（比如 c200 里的 2 不会被误当成按键 2）。
+ *
+ *    ⚠ 烧录按键板之前，把"本板 TX -> 按键板 RX"这根线拔掉（或给本板断电），
+ *      否则本板 TX 会和 USB 串口芯片抢线，导致按键板烧录失败。
+ *      ★ 只留"按键板 TX -> 本板 RX + 共地"两根线功能完全正常，推荐就这么接。
+ *
+ *    ⚠ 两块板的 D0/D1 都连着各自的 USB 口，所以串口线上"三方共用"：
+ *      你在某一侧串口监视器里敲的字会同时发给两块板。
+ *      演示时只看**本板（主控）**的串口监视器最清楚。
+ *
+ *    【文件关系】
+ *      · task3_arduino.ino   —— 旧版（D6->D10 软串口），原文件保留未动。
+ *      · 本文件              —— 配套新版按键板 uno_keys_basic.ino
+ *                               / uno_keys_check.ino 使用。
+ *      两个版本按键功能完全一样，按实际接线二选一即可。
+ *      */
+#include <Servo.h>
+
+Servo base, fArm, rArm, claw;
+
+const int baseMin = 0;    const int baseMax = 180;
+const int rArmMin = 0;    const int rArmMax = 120;
+const int fArmMin = 90;   const int fArmMax = 180;
+const int clawMin = 60;   const int clawMax = 120;
+
+/* ★ 硬件更新后爪子行程为 60° ~ 120°：60 = 完全张开、120 = 完全闭合。
+ *   方向没变 —— 角度越小夹爪越开，角度越大夹得越紧。 */
+const int CLAW_OPEN  = 60;    // 张开
+const int CLAW_CLOSE = 120;   // 闭合
+const int CLAW_GRIP  = 120;   // 抓取时用的角度（夹不牢就贴海绵加摩擦；堵转就把这里调小，如 115）
+
+int DSD = 40;                 // 每转 1 度等多少毫秒
+const int DSD_MIN = 15;
+const int DSD_MAX = 100;
+const int DSD_STEP = 5;
+
+/* 夹爪夹住之后的停顿时间*/
+const unsigned long CLAW_SETTLE_MS = 300;
+
+/* 松开物体之后多停这么久，让机械臂稳一稳，免得刚放手就把物体带倒 */
+const unsigned long STEP_PAUSE = 150;
+
+/* ---- 单个舵机的走步速度（数值越大 → 走得越慢）---- */
+const int MOVE_STEP_MS = 40;
+const int CLAW_STEP_MS = 50;
+
+/* ============================================================================
+ *  【第 4 部分】任务二的 A / B / C 动作序列（与任务二的程序保持同步）
+ *  写法：{ '代号', 角度 }，按顺序从上往下执行，一条只动一个舵机。
+ * ==========================================================================*/
+struct Step { char s; int a; };
+
+const Step SEQ_A[] = {
+  { 'b',  60 },
+  { 'r',  40 },
+  { 'f', 150 },
+  { 'c', 120 },
+  { 'f',  90 },
+  { 'b', 120 },
+  { 'r',  45 },
+  { 'f', 135 },
+  { 'r',  20 },
+  { 'c',  60 },
+  { 'r',  90 },
+  { 'f',  90 },
+  { 'b',  90 }
+};
+
+const Step SEQ_B[] = {
+  { 'f', 150 },
+  { 'c', 120 },
+  { 'f', 130 },
+  { 'b',  60 },
+  { 'r',  80 },
+  { 'c',  60 },
+  { 'f',  90 },
+  { 'r',  90 },
+  { 'b',  90 }
+};
+
+const Step SEQ_C[] = {
+  { 'b', 150 },
+  { 'r',  30 },
+  { 'f', 150 },
+  { 'c', 120 },
+  { 'f',  90 },
+  { 'b',  80 },
+  { 'f', 150 },
+  { 'c',  60 },
+  { 'f',  90 },
+  { 'r',  90 },
+  { 'b',  90 }
+};
+
+const Step* const SEQ[3] = { SEQ_A, SEQ_B, SEQ_C };
+const byte SEQ_LEN[3] = {
+  sizeof(SEQ_A) / sizeof(Step),
+  sizeof(SEQ_B) / sizeof(Step),
+  sizeof(SEQ_C) / sizeof(Step)
+};
+
+
+
+/* ============================================================================
+ *  【第 5 部分】★★★ 动作录制 —— 数据结构与内存账 ★★★
+ *  --------------------------------------------------------------------------
+ *  【录制什么】
+ *    录制时每 1 秒采样一次四个舵机的**当前角度**，存进数组。
+ *    播放时按同样的节奏（每帧 1 秒）把角度写回去，机械臂就复现了那段动作。
+ *    这个"1 秒"就是下面的 REC_PERIOD_MS，本次按要求从 100ms 改成了 1000ms。
+ *
+ *  【★ 内存账：为什么容量定成 150 帧？—— 这段答辩很可能被问，必须会算】
+ *    题目要求"时长大于 10 秒"。
+ *      采样周期 1000ms（1Hz） → 一帧就是 1 秒，**帧数直接等于秒数**
+ *      150 帧 = 150 秒，是题目要求的 15 倍，余量非常充足
+ *      每帧存 4 个舵机角度，范围 0~180，用 1 字节(byte)就够
+ *        （byte 是 0~255，装 180 完全没问题；用 int 会白花一倍内存）
+ *      150 帧 × 4 字节 = 600 字节
+ *    Uno 的 SRAM 只有 2048 字节，600 字节约 29%，加上程序其它部分
+ *    一共 60% 左右 —— 能放下，但也不能再翻倍了。
+ *    ★ 其实 1Hz 下 30 帧（30 秒）就远超题目要求了，能省下 480 字节 RAM。
+ *      保留 150 是为了"随便录、不慌"。真想省内存，把 MAX_FRAMES 改小就行。
+ *
+ *  【★ 1 秒一帧，动作会不会很粗糙？（这个必须能回答）】
+ *    会有影响，但没有想象中大，原因两条：
+ *      ① 回放时会**插值**（见 playRecording）：两帧之间不是"一秒跳一格"，
+ *         而是把这一秒按时间切成 50 小步（每 20ms 一步）平滑走过去 ——
+ *         所以看起来是"稳稳地慢慢走"，不会"一格一格地蹦"。
+ *         这也是 2026-10-07 特意改过的地方：老写法按"角度差 ÷ 3 度"
+ *         切步数，1 秒一帧时只切出几步、每步等 200ms，肉眼就是卡。
+ *      ② 采样粗的代价主要发生在**录制**时：1 秒里快速甩一下摇杆，
+ *         那一下只会被记下两个端点，中间的全丢了。
+ *         所以 1 秒采样的正确演示手法是
+ *         ——**慢速、匀速、大幅度地演一段动作**，这也正是评委爱看的。
+ *    ★ 想让录制更细腻（比如 5Hz），把 REC_PERIOD_MS 改成 200 即可，
+ *      回放代码一处都不用动（它是按时间切片的，和采样率无关）。
+ *
+ *  【★ 为什么不用 EEPROM 存？—— 这个决策也要能讲清楚】
+ *    EEPROM 是掉电不丢的存储，看起来很适合"保存录制的动作"，但：
+ *      1) Uno 的 EEPROM 只有 1024 字节，装 150 帧 × 4 字节 = 600 字节
+ *         还要留空间，非常紧张；
+ *      2) EEPROM 有**擦写寿命**（约 10 万次）。演示时反复录、反复擦，
+ *         一节课下来可能就几十上百次，长期用会写坏；
+ *      3) 而且写 EEPROM 每次约 3.3ms，写 600 字节要 2 秒，会把
+ *         采样节奏全打乱；
+ *      4) 最关键的：**题目根本没要求掉电保存**。
+ *         "按下按键 3 播放上一次录制的动作" —— 只要断电之前能播就行。
+ *    → 所以用内存数组。RAM 掉电就没了，但电源一直是通的，符合需求。
+ *      （如果以后想加掉电保存，再按上面那三条成本去权衡。）
+ *
+ *  【★ 为什么每帧不存时间戳？】
+ *    因为录制期间的采样是**非阻塞**的：主循环一直在跑，每满 1000ms
+ *    采一帧，间隔很稳定。而且录制时你只能推摇杆（不能发阻塞指令），
+ *    所以间隔不会漂。既然间隔恒定，就不必每帧存一个时间戳。
+ *    ★ 这样省下 150 字节，而且"第 n 帧 = 第 n 秒"心算就能得到，
+ *      按键 5 打印表格时也是靠这个换算列时间的。
+ *      代价是：如果你在录制过程中发了耗时指令（比如 b90 这种阻塞式转舵机），
+ *      那一帧会被推迟，回放时略快。
+ *      → 结论：**录制期间只推摇杆，别发指令**。注释里提醒自己。
+ * ==========================================================================*/
+const int MAX_FRAMES = 150;             // 最多 150 帧（150 秒 @1Hz）
+
+byte recBase[MAX_FRAMES];               // 每帧的 base 角度
+byte recR[MAX_FRAMES];                  // 每帧的 rArm 角度
+byte recF[MAX_FRAMES];                  // 每帧的 fArm 角度
+byte recClaw[MAX_FRAMES];               // 每帧的 claw 角度
+int  recCount = 0;                      // 实际录了多少帧
+
+/*  ★★ 采样周期：本次按要求改成 1 秒（原来是 100ms）★★
+ *    这个常数同时决定两件事：
+ *      · 录制的粗细：1 秒采一次，动作细节会被简化（见上面第 5 部分的说明）
+ *      · 回放的快慢：回放按同样的节奏走，所以录 15 帧 = 回放 15 秒
+ *    ★ 想回到原来的细采样（10Hz），只把这一个数字改回 100 就行，
+ *      代码其它地方一处都不用动 —— 这就是"参数和逻辑分开"的好处。 */
+const unsigned long REC_PERIOD_MS = 1000;     // 采样周期（1Hz，每 1 秒一帧）
+unsigned long lastRecMs = 0;
+bool recording = false;                        // 是否正在录制
+
+/* ---- 播放的平滑参数 ★★ 2026-10-07 改过，这里是最关键的一处 ★★ ----
+ *
+ *  【★ 平滑程度取决于"多久更新一次角度"，不是"每次转多少度"】
+ *    Servo 库在 AVR 上每 20ms 刷新一次 PWM（50Hz），所以：
+ *      · 每 20ms 写一次 → 这就是这套硬件能表现出的**最平滑**效果；
+ *      · 每 100ms 才写一次 → 肉眼就能看出"一格一格"地蹦。
+ *
+ *  【★ 老写法为什么会"卡"？（这就是你说的问题）】
+ *    老写法是"按角度切片"：步数 = 本帧最大角度差 ÷ 3 度。
+ *    1 秒一帧时，如果这一帧只转了 15 度，那只有 5 步，
+ *    每步就要等 1000/5 = 200ms —— 一秒只动 5 下，当然卡。
+ *    采样率越低，这个算法切出来的步数越少，就越卡。
+ *
+ *  【★ 新写法：按"时间"切片】
+ *    一帧固定切成 REC_PERIOD_MS / PLAY_STEP_MS 步，
+ *    每步固定等 PLAY_STEP_MS。这样**不管这一帧转了多少度**，
+ *    都保持每秒 50 次更新 —— 平稳、连续，和采样率无关。
+ *    总时长仍然是精确的一帧时间（50 × 20ms = 1000ms），
+ *    所以回放的节奏和录制时一模一样，不会变慢。
+ * ==========================================================================*/
+const int PLAY_STEP_MS = 20;            // 每 20ms 写一次角度（= 舵机 PWM 刷新周期）
+
+
+/* ============================================================================
+ *  【第 6 部分】循环夹取的状态机
+ * ==========================================================================*/
+int nextObject = 0;                     // 下一次按键1要夹哪个物体（0=A 1=B 2=C）
+
+
+/* ============================================================================
+ *  【第 7 部分】摇杆（录制时必须用它手动操控）
+ * ==========================================================================*/
+const int pinJoy_LX = A0;
+const int pinJoy_LY = A1;
+const int pinJoy_RX = A2;
+const int pinJoy_RY = A3;
+
+const int DIR_LX = -1;
+const int DIR_LY = -1;
+const int DIR_RX = -1;
+const int DIR_RY = -1;
+
+const int DEADZONE = 60;
+const int MAX_STEP = 1;
+const int UPDATE_MS = 20;
+const int AXIS_SAMPLES = 4;
+
+int cLX, cLY, cRX, cRY;
+unsigned long lastJoyMs = 0;
+
+/*  ★ 注意：录制期间摇杆必须**一直可用**，这是按键 2 的要求
+ *    （"此时需人工通过摇杆操控机械臂"）。所以录制时不能像任务二
+ *    那样用 busy 标志把摇杆关掉。 */
+bool busy = false;                      // 只在执行自动动作序列时为 true
+
+
+/* ============================================================================
+ *  【第 8 部分】串口行缓冲
+ *    ★ 按键板的单字符和手敲的长指令**都从 Serial 走**，
+ *      所以统一按"行"处理：换行结束，或者静默 50ms 也算结束
+ *      （按键板不发换行，靠的就是后面这条）。
+ *      具体规则见 loop() 里 ① 的注释。
+ * ==========================================================================*/
+const unsigned long SERIAL_IDLE_MS = 50;
+const unsigned long SERIAL_MAX_LEN = 32;
+String cmdBuf = "";
+unsigned long lastCharMs = 0;
+
+
+/* ============================================================================
+ *  【第 9 部分】函数原型声明
+ * ==========================================================================*/
+void setup();
+void loop();
+
+void onKeyChar(char c);                 // 按键板 / 手敲 送来的单字符按键
+void onButton1();                       // 循环夹取
+void onButton2();                       // 录制 开/关
+void onButton3();                       // 播放
+void onButton4();                       // 回中
+void startRecording();
+void stopRecording();
+void playRecording();
+void reportRecordInfo();
+
+void doTask(int idx);                   // 执行一个物体的整条航路点序列（同任务二）
+void armIniPos();
+
+void handleSerialLine(String line);
+void runCmd(char cmd, String arg);
+void servoCmd(char servoName, int toPos, int servoDelay);
+int  servoIndex(char name);
+void servoWriteAt(int idx, int angle);
+int  servoReadAt(int idx);
+bool   angleInRange(char name, int v);
+void   printHelp();
+void   reportStatus();
+
+int  readAxisAvg(int pin);
+void calibrateJoystick();
+int  axisToStep(int joyPin, int center, int dir);
+void nudgeServo(Servo &s, int step, int minA, int maxA);
+void updateJoystick();
+
+
+/* ============================================================================
+ *  setup() —— 开机只跑一次
+ * ==========================================================================*/
+void setup(){
+  base.attach(9);   delay(200);
+  rArm.attach(8);   delay(200);
+  fArm.attach(7);   delay(200);
+  claw.attach(6);   delay(200);
+
+  base.write(90);        delay(10);
+  fArm.write(90);        delay(10);
+  rArm.write(90);        delay(10);
+  claw.write(CLAW_OPEN); delay(10);
+
+  /* ---- 一路串口 ----
+   * Serial = 硬件串口（D0/D1），既通电脑 USB，也通按键板。
+   * ★ 按键板的 TX 就接在本板的 RX(D0) 上，所以按键指令从 Serial 进来，
+   *   和你在串口监视器里手敲的指令走同一条路。
+   * ★ 波特率必须和按键板那边一致（都是 9600）。 */
+  Serial.begin(9600);
+
+  cmdBuf.reserve(SERIAL_MAX_LEN);
+
+  Serial.println(F("=========================================="));
+  Serial.println(F("[Task 3] keypad(UNO) + Record/Play/Home"));
+  Serial.println(F("  key1='1' cycle pick   key2='2' record"));
+  Serial.println(F("  key3='3' play         key4='4' go home"));
+  Serial.println(F("  link: keypad TX(D1) -> this board RX(D0), GND-GND"));
+  Serial.println(F("  (you can also type 1/2/3/4 here for a quick test)"));
+  Serial.println(F("=========================================="));
+
+  delay(300);
+  calibrateJoystick();
+
+  reportRecordInfo();
+}
+
+
+/* ============================================================================
+ *  loop() —— 主循环
+ * ==========================================================================*/
+void loop(){
+
+  /* ------------------------------------------------------------------
+   *  ① 读串口（按键板发来的按键 + 电脑手敲的指令，都从这一路进来）
+   *
+   *  【为什么要"攒成一行"而不是"收到一个字符立刻处理"？】
+   *    因为现在这一路上有两种东西混在一起：
+   *      · 按键板发来的：单个字符 '1'~'4' / '?'，没有换行
+   *      · 你手敲的：可能是 "1"，也可能是 "b90" 这种带数字的调试指令
+   *    如果见到字符就当按键处理，"c200" 里的 '2' 会被误当成按键 2。
+   *    所以统一按"行"处理，由下面的三条规则区分：
+   *      ① 遇到换行 \n \r           -> 这行结束，交给 handleSerialLine()
+   *      ② 静默超过 50ms 没有新字符 -> 也算这行结束（★ 按键板的单字符
+   *         就是靠这条被识别出来的：它不发换行）
+   *      ③ 行太长（>32 字节）        -> 清空，防垃圾数据撑爆缓冲
+   *
+   *  ★ 50ms 的延迟在按按键时完全感觉不到（人眼极限大约 100ms）。
+   * ------------------------------------------------------------------ */
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    lastCharMs = millis();
+
+    if (c == '\n' || c == '\r') {
+      if (cmdBuf.length() > 0) {
+        handleSerialLine(cmdBuf);
+        cmdBuf = "";
+      }
+    } else {
+      cmdBuf += c;
+      if (cmdBuf.length() > SERIAL_MAX_LEN) {
+        cmdBuf = "";
+        Serial.println(F("+Warning: Command Too Long, buffer cleared."));
+      }
+    }
+  }
+  if (cmdBuf.length() > 0 && (millis() - lastCharMs >= SERIAL_IDLE_MS)) {
+    handleSerialLine(cmdBuf);
+    cmdBuf = "";
+  }
+
+  /* ------------------------------------------------------------------
+   *  ② ★ 录制采样（非阻塞）
+   *
+   *  ★ 为什么用 millis() 判断而不是 delay(1000)？
+   *    因为录制期间**必须同时**让摇杆正常工作（人要用摇杆操控机械臂）。
+   *    如果这里用 delay(1000)，主循环每 1 秒会有整整 1 秒完全卡住，
+   *    摇杆就变成"每秒才更新一次"，手感一塌糊涂，根本没法操控。
+   *    用 millis() 判断"够 1 秒了吗"，不够就直接过去 ——
+   *    摇杆照常 20ms 刷一次，采样照常 1 秒一次，互不干扰。
+   * ------------------------------------------------------------------ */
+  if (recording) {
+    if (millis() - lastRecMs >= REC_PERIOD_MS) {
+      lastRecMs = millis();
+
+      if (recCount < MAX_FRAMES) {
+        recBase[recCount] = (byte)base.read();
+        recR[recCount]    = (byte)rArm.read();
+        recF[recCount]    = (byte)fArm.read();
+        recClaw[recCount] = (byte)claw.read();
+        recCount++;
+
+        /* ★ 1 秒一帧，所以每采一帧就在电脑上打一行，实时告诉你
+         *   "已经录了多少秒"。题目要求 >10 秒，盯着这个数字最直观。
+         *   （改 10Hz 的时候这里是"每 10 帧打一个点"，现在一帧就是一秒，
+         *     所以不用再按 10 帧分组了。） */
+        Serial.print(F("  rec... "));
+        Serial.print(recCount);
+        Serial.println(F(" s"));
+      } else {
+        /* ★ 录满了自动停 —— 这是"防呆"设计。
+         *   如果不自动停，数组会越写越界，把后面的变量冲掉，
+         *   现象是程序行为莫名其妙（比如舵机乱动、串口乱码），
+         *   而且很难联想到是"录制录太久"导致的。 */
+        Serial.println(F("+Record buffer FULL, auto stop."));
+        stopRecording();
+      }
+    }
+  }
+
+  /* ---- ③ 摇杆：录制时必须可用；执行自动动作序列时禁用 ---- */
+  if (!busy) {
+    updateJoystick();
+  }
+}
+
+
+/* ============================================================================
+ *  【第 10 部分】★★★ 四个按键的功能实现 ★★★
+ * ==========================================================================*/
+
+/*  onKeyChar() —— 单字符按键分发
+ *    ★ 这里做一个宽松处理：把 '\n' '\r' ' ' 直接忽略掉。
+ *      因为有些串口工具或按键板那边会在字符后面补一个换行，
+ *      不忽略的话会多触发一次"未知按键"。 */
+void onKeyChar(char c){
+  switch (c) {
+    case '1': onButton1(); break;
+    case '2': onButton2(); break;
+    case '3': onButton3(); break;
+    case '4': onButton4(); break;
+    case '?':                                 // ★ 链路测试（按键板发命令 s 时发来的）
+      /*  只打印一行就完事，**不动机械臂**。
+       *  用途：按键板不用碰按键，就能验证 TX->RX 这根线 + 共地通不通。
+       *  （按键板那边见 uno_keys_check.ino 的 sendLinkTest()）
+       *  ★ 这行字会顺着 RX 流回按键板，所以按键板自己的监视器里
+       *    也能看到它 —— 不用来回切窗口。 */
+      Serial.println(F("+LINK OK (from keypad)"));
+      break;
+    case '\n': case '\r': case ' ': break;    // 静默忽略
+    default:
+      Serial.print(F("+Unknown key: ")); Serial.println(c);
+      break;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ *  按键 1 —— 循环执行夹取动作（10%）
+ *
+ *  ★ "循环"是怎么实现的？
+ *    用一个变量 nextObject 记住"下次该夹哪一个"，每按一次就 +1，
+ *    到 3 就绕回 0。这就是最简单的状态机/环形计数：
+ *        第一次按 → 夹 A（nextObject 变成 1）
+ *        第二次按 → 夹 B（变成 2）
+ *        第三次按 → 夹 C（变成 0）
+ *        第四次按 → 又夹 A ...
+ *  ★ 为什么用取余（% 3）而不是 if (nextObject > 2) nextObject = 0？
+ *    取余一行搞定，而且 nextObject 永远不会跑到 3 以外的值，
+ *    不会有"忘记加边界判断"的隐患。
+ * ------------------------------------------------------------------------ */
+void onButton1(){
+  if (recording) {
+    Serial.println(F("+Key1: ignored while recording."));
+    return;
+  }
+  if (busy) {
+    Serial.println(F("+Key1: ignored, arm is busy."));
+    return;
+  }
+
+  int obj = nextObject;
+  nextObject = (nextObject + 1) % 3;       // 环形递增：0→1→2→0
+
+  Serial.print(F("+Key1: cycle pick object #"));
+  Serial.println(obj + 1);
+
+  doTask(obj);                             // 执行夹取 + 放置
+}
+
+/* ---------------------------------------------------------------------------
+ *  按键 2 —— 录制 开 / 关
+ *
+ *  ★ 同一个按键管"开始"和"结束"，怎么区分？
+ *    靠 recording 这个布尔标志：现在是"没在录"，按下去就"开始录"；
+ *    现在是"正在录"，按下去就"结束录"。
+ *    这叫 **toggle（开关）**，是嵌入式里最常见的交互模式。
+ *    ★ 好处：只占一个按键。坏处：人可能会忘记当前是在录还是没在录 ——
+ *      所以每次切换都在串口**明确打印**当前状态，让人一眼看到。
+ * ------------------------------------------------------------------------ */
+void onButton2(){
+  if (busy) {
+    Serial.println(F("+Key2: ignored, arm is busy (wait for it to finish)."));
+    return;
+  }
+  if (recording) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+}
+
+void startRecording(){
+  recCount = 0;                            // 从头开始（旧数据作废）
+  recording = true;
+  lastRecMs = millis();
+
+  Serial.println(F(""));
+  Serial.println(F("+==============================+"));
+  Serial.println(F("+ REC START. Use the JOYSTICK!"));
+  Serial.println(F("+  (record >10s, then press key2 again)"));
+  Serial.println(F("+==============================+"));
+  Serial.println(F("+ TIP: do NOT send other commands while recording,"));
+  Serial.println(F("+      it will stretch the frame timing."));
+}
+
+void stopRecording(){
+  recording = false;
+
+  Serial.println(F(""));
+  Serial.print(F("+ REC STOP. frames = "));
+  Serial.print(recCount);
+  Serial.print(F("  -> duration = "));
+  Serial.print((float)recCount * REC_PERIOD_MS / 1000.0, 1);
+  Serial.println(F(" s"));
+
+  /* ★ 自检：题目要求"时长大于 10 秒"。录短了要立刻提醒，
+   *   否则按了播放才发现"怎么一下就完了"。 */
+  if ((float)recCount * REC_PERIOD_MS / 1000.0 < 10.0) {
+    Serial.println(F("+ WARNING: shorter than 10s required by the task!"));
+    Serial.println(F("+          record again and move for longer."));
+  } else {
+    Serial.println(F("+ OK: length satisfies the >10s requirement."));
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ *  按键 3 —— 播放（10%）
+ *    这个函数只做"能不能播"的检查，真正的播放交给 playRecording()，
+ *    拆开是为了让按键处理和播放逻辑各自清楚（也方便从串口调试指令调用）。
+ * ------------------------------------------------------------------------ */
+void onButton3(){
+  if (recording) {
+    Serial.println(F("+Key3: stop recording first (press key2)."));
+    return;
+  }
+  if (busy) {
+    Serial.println(F("+Key3: ignored, arm is busy."));
+    return;
+  }
+  playRecording();
+}
+
+/*  playRecording() —— 真正执行回放
+ *
+ *  ★ 播放的节奏怎么还原？
+ *    因为录制时是固定 1 秒采一帧，播放时也让每帧持续 1 秒就还原了。
+ *    在每帧内部再做细分插值（把角度差分成若干小步），轨迹就更平滑。
+ *    ★ 每帧 1 秒不算慢：一次按键给 1 秒的"表演时间"，
+ *      整个动作演下来通常是十几到几十秒，看起来反而是从容的。
+ *
+ *  ★ 为什么播放可以用"阻塞式"写法（里面带 delay）？
+ *    因为任务三没有要求"播放过程中可暂停"。播放是个连续动作，
+ *    中途不需要响应别的输入，所以最简单的阻塞写法最不容易出 bug。
+ *    （任务五的暂停/继续要求就不一样了，那边必须用状态机 ——
+ *      对比一下 task5_draw.ino 的 drawTick()，就能看出区别。）
+ * ------------------------------------------------------------------------ */
+void playRecording(){
+  if (recCount < 2) {
+    Serial.print(F("+Play: nothing recorded yet (frames="));
+    Serial.print(recCount);
+    Serial.println(F(")."));
+    return;
+  }
+
+  busy = true;                             // 播放期间禁用摇杆，防止干扰
+
+  Serial.println(F(""));
+  Serial.println(F("+========== PLAY RECORDING ==========+"));
+  Serial.print(F("+ frames = ")); Serial.print(recCount);
+  Serial.print(F("   duration = "));
+  Serial.print((float)recCount * REC_PERIOD_MS / 1000.0, 1);
+  Serial.println(F(" s"));
+
+  for (int i = 0; i < recCount; i++) {
+
+    /* ★ 第一帧直接写过去（没有"上一帧"可以插值） */
+    int curB = recBase[i], curR = recR[i], curF = recF[i], curC = recClaw[i];
+
+    if (i == 0) {
+      base.write(curB); rArm.write(curR); fArm.write(curF); claw.write(curC);
+      delay(REC_PERIOD_MS);
+      continue;
+    }
+
+    /* ★ 从上一帧插值到本帧：
+     *   把这一帧的时间切成 50 小步（每步 20ms），四个舵机同时按比例走过去。
+     *   ★ 注意：**不再**按"角度差 ÷ 3 度"来算步数了 ——
+     *     那样在 1 秒一帧时只会切出几步、每步要等 200ms，就是你感觉到的"卡"。
+     *     按时间切之后，不管转多少度都是每秒 50 次更新，肉眼看着就是连续的。 */
+    int preB = recBase[i - 1], preR = recR[i - 1], preF = recF[i - 1], preC = recClaw[i - 1];
+
+    int sub = (int)(REC_PERIOD_MS / PLAY_STEP_MS);   // 每帧切几小步（1000/20 = 50）
+    if (sub < 1) sub = 1;                            // 兜底：至少一步
+
+    int stepMs = (int)(REC_PERIOD_MS / sub);         // 每小步实际延时，保证总时长 = 一帧
+
+    for (int k = 1; k <= sub; k++) {
+      /* 线性插值：位置 = 上一帧 + (本帧-上一帧) × k/sub */
+      int vB = preB + (int)((long)(curB - preB) * k / sub);
+      int vR = preR + (int)((long)(curR - preR) * k / sub);
+      int vF = preF + (int)((long)(curF - preF) * k / sub);
+      int vC = preC + (int)((long)(curC - preC) * k / sub);
+
+      base.write(vB); rArm.write(vR); fArm.write(vF); claw.write(vC);
+
+      /* ★ 每一步延时 = 本帧应持续的时间 ÷ 细分数
+       *   这样"细分前后总时间不变"，节奏才和录制时一致。
+       *   不这样做的话，细分会让动作整体变慢，回放比录制时长了一截。 */
+      delay(stepMs);
+    }
+  }
+
+  Serial.println(F("+========== PLAY DONE ==========+"));
+  busy = false;
+}
+
+/* ---------------------------------------------------------------------------
+ *  按键 4 —— 回中（5%）
+ *    "机械臂回归到初始状态时的位置" —— 也就是四个舵机的初始角度：
+ *        base 90（正前方）、rArm 90、fArm 90、claw 60（张开）
+ *    ★ 和别的按钮不同，回中要**平滑**地回去（逐个舵机依次返回），
+ *      不能直接 read 出目标角度一次写下去。因为播放刚结束时机械臂
+ *      可能停在很偏的位置，猛地弹回原位有两个风险：
+ *        ① 惯性很大，可能把底座带得移位；
+ *        ② 如果笔或者其他东西还在臂上，会甩出去。
+ *      顺带一提，演示时"平滑回中"看起来也更专业。
+ * ------------------------------------------------------------------------ */
+void onButton4(){
+  if (recording) {
+    Serial.println(F("+Key4: ignored while recording."));
+    return;
+  }
+  if (busy) {
+    Serial.println(F("+Key4: ignored, arm is busy."));
+    return;
+  }
+
+  Serial.println(F("+Key4: go HOME."));
+  busy = true;
+  servoCmd('b', 90, MOVE_STEP_MS);
+  servoCmd('r', 90, MOVE_STEP_MS);
+  servoCmd('f', 90, MOVE_STEP_MS);
+  servoCmd('c', CLAW_OPEN, CLAW_STEP_MS);
+  busy = false;
+
+  /* ★ 回中后把循环夹取的指针也归零。
+   *   为什么顺手做这件事？因为"回中"在演示里的语义就是"重置到开始状态"，
+   *   那么"下次按键1从 A 开始"才符合直觉。否则按了回中之后，
+   *   下一次按键1 夹的是 B 或 C，人会以为程序乱了。 */
+  nextObject = 0;
+  Serial.println(F("+Home done. next key1 will pick object A."));
+}
+
+/*  reportRecordInfo() —— 打印当前录制状态 */
+void reportRecordInfo(){
+  Serial.print(F("+Record status: "));
+  if (recording) {
+    Serial.print(F("RECORDING now, frames="));
+    Serial.println(recCount);
+  } else if (recCount == 0) {
+    Serial.println(F("empty (nothing recorded yet)"));
+  } else {
+    Serial.print(F("stored frames="));
+    Serial.print(recCount);
+    Serial.print(F("  duration="));
+    Serial.print((float)recCount * REC_PERIOD_MS / 1000.0, 1);
+    Serial.println(F(" s  (press key3 to play)"));
+  }
+}
+
+
+/* ============================================================================
+ *  【第 11 部分】夹取动作序列（与任务二的 A/B/C 完全一致，按键1 调用）
+ *  逐条取序列 → 只驱动那一条指定的一个舵机 → 走完再读下一条。
+ *  ★ busy 标志：序列执行期间置 true，让摇杆停下来；
+ *    结尾一定要复位成 false，否则之后整个程序都收不到摇杆输入。
+ * ==========================================================================*/
+void doTask(int idx){
+  if (idx < 0 || idx > 2) return;
+  if (SEQ_LEN[idx] == 0) return;
+
+  busy = true;
+
+  const char  name = (idx == 0) ? 'A' : (idx == 1) ? 'B' : 'C';
+  const Step* seq  = SEQ[idx];
+  const byte  n    = SEQ_LEN[idx];
+
+  Serial.print(name);
+  Serial.println(F(" start"));
+
+  for (byte i = 0; i < n; i++) {
+    char s = seq[i].s;
+    int  a = seq[i].a;
+
+    Serial.print(s);
+    Serial.print(' ');
+    Serial.println(a);
+
+    int k = servoIndex(s);
+    if (k < 0) continue;
+    if (!angleInRange(s, a)) continue;
+
+    if (k == 3) {
+      servoCmd('c', a, CLAW_STEP_MS);
+      delay(CLAW_SETTLE_MS);
+    } else {
+      servoCmd(s, a, MOVE_STEP_MS);
+      delay(STEP_PAUSE);
+    }
+  }
+
+  Serial.print(name);
+  Serial.println(F(" done"));
+
+  busy = false;
+}
+
+void armIniPos(){
+  busy = true;
+  servoCmd('b', 90, MOVE_STEP_MS);
+  servoCmd('r', 90, MOVE_STEP_MS);
+  servoCmd('f', 90, MOVE_STEP_MS);
+  servoCmd('c', CLAW_OPEN, CLAW_STEP_MS);
+  busy = false;
+}
+
+
+/* ============================================================================
+ *  【第 12 部分】串口指令（USB 调试用）
+ * ==========================================================================*/
+void handleSerialLine(String line){
+  line.trim();
+  if (line.length() == 0) return;
+
+  /* ★ 关键：一个字符的输入直接当按键处理。
+   *   按键板发来的 '1'~'4' / '?' 就是这个形式（它不发换行，
+   *   靠 loop() 里"静默 50ms"那条规则凑成一行）。
+   *   另外在这里敲 1/2/3/4 也能触发四个按键功能 ——
+   *   就算按键板没接上，也能把整个任务三测完。 */
+  if (line.length() == 1 &&
+      ((line[0] >= '1' && line[0] <= '4') || line[0] == '?')) {
+    Serial.print(F("+key: ")); Serial.println(line[0]);   // 回显，便于排查
+    onKeyChar(line[0]);
+    return;
+  }
+
+  String word = line;
+  word.toLowerCase();
+
+  if (word == "help")   { printHelp();      return; }
+  if (word == "status") { reportStatus();   return; }
+  if (word == "rec")    { reportRecordInfo(); return; }
+  if (word == "home" || word == "init") { onButton4(); return; }
+  if (word == "play")   { onButton3(); return; }
+  if (word == "open"  || line == "O") { servoCmd('c', CLAW_OPEN,  DSD); return; }
+  if (word == "close" || line == "S") { servoCmd('c', CLAW_CLOSE, DSD); return; }
+
+  char   cmd = line.charAt(0);
+  String arg = line.substring(1);
+  arg.trim();
+  runCmd(cmd, arg);
+}
+
+void runCmd(char cmd, String arg){
+  if (cmd == 'b' || cmd == 'c' || cmd == 'f' || cmd == 'r') {
+    if (arg.length() == 0) {
+      Serial.println(F("+Warning: Need a number after the letter, e.g. b90"));
+      return;
+    }
+    servoCmd(cmd, arg.toInt(), DSD);
+    return;
+  }
+
+  switch (cmd) {
+    case 'o': reportStatus(); break;
+    case 'i': armIniPos();    break;
+
+    default:
+      Serial.println(F("Unknown Command. (send 'help')"));
+      break;
+  }
+}
+
+
+/* ============================================================================
+ *  【第 13 部分】通用工具
+ * ==========================================================================*/
+int servoIndex(char name){
+  if (name == 'b') return 0;
+  if (name == 'r') return 1;
+  if (name == 'f') return 2;
+  if (name == 'c') return 3;
+  return -1;
+}
+
+void servoWriteAt(int idx, int angle){
+  if      (idx == 0) base.write(angle);
+  else if (idx == 1) rArm.write(angle);
+  else if (idx == 2) fArm.write(angle);
+  else if (idx == 3) claw.write(angle);
+}
+
+int servoReadAt(int idx){
+  if (idx == 0) return base.read();
+  if (idx == 1) return rArm.read();
+  if (idx == 2) return fArm.read();
+  if (idx == 3) return claw.read();
+  return -1;
+}
+
+bool angleInRange(char name, int v){
+  switch (name) {
+    case 'b': return (v >= baseMin && v <= baseMax);
+    case 'r': return (v >= rArmMin && v <= rArmMax);
+    case 'f': return (v >= fArmMin && v <= fArmMax);
+    case 'c': return (v >= clawMin && v <= clawMax);
+    default:  return false;
+  }
+}
+
+void servoCmd(char servoName, int toPos, int servoDelay){
+  int idx = servoIndex(servoName);
+  if (idx < 0) return;
+  if (!angleInRange(servoName, toPos)) return;
+  int fromPos = servoReadAt(idx);
+
+  if (fromPos <= toPos) {
+    for (int i = fromPos; i <= toPos; i++) { servoWriteAt(idx, i); delay(servoDelay); }
+  } else {
+    for (int i = fromPos; i >= toPos; i--) { servoWriteAt(idx, i); delay(servoDelay); }
+  }
+}
+
+
+void reportStatus(){
+  Serial.println(F(""));
+  Serial.println(F("+ Robot-Arm Status Report +"));
+  Serial.print(F("Base  Position: "));   Serial.println(base.read());
+  Serial.print(F("Rear  Arm Pos : "));   Serial.println(rArm.read());
+  Serial.print(F("Front Arm Pos : "));   Serial.println(fArm.read());
+  Serial.print(F("Claw  Position: "));   Serial.println(claw.read());
+  Serial.print(F("Speed DSD     : "));   Serial.println(DSD);
+  Serial.print(F("Recording     : "));   Serial.println(recording ? F("YES") : F("no"));
+  Serial.print(F("Record frames : "));   Serial.println(recCount);
+  Serial.print(F("Next object   : "));
+  Serial.println(nextObject == 0 ? F("A") : nextObject == 1 ? F("B") : F("C"));
+  Serial.println(F("++++++++++++++++++++++++++"));
+  Serial.println(F(""));
+}
+
+void printHelp(){
+  Serial.println(F(""));
+  Serial.println(F("================= Command List ================="));
+  Serial.println(F("[Same as the keypad keys]"));
+  Serial.println(F("  1  ->  cycle pick (A -> B -> C -> A ...)"));
+  Serial.println(F("  2  ->  record start / stop (toggle)"));
+  Serial.println(F("  3  ->  play the recorded motion"));
+  Serial.println(F("  4  ->  go home (initial position)"));
+  Serial.println(F("[Debug]"));
+  Serial.println(F("  o / status ->  print angles + record state"));
+  Serial.println(F("  rec        ->  print record buffer info"));
+  Serial.println(F("  b/r/f/c + number ->  single servo absolute angle"));
+  Serial.println(F("  O/open, S/close   ->  claw open / close"));
+  Serial.println(F("  i / home   ->  back to initial position"));
+  Serial.println(F("  help       ->  this list"));
+  Serial.println(F("================================================"));
+  Serial.println(F(""));
+}
+
+
+/* ============================================================================
+ *  【第 14 部分】摇杆
+ * ==========================================================================*/
+int readAxisAvg(int pin){
+  long sum = 0;
+  for (int i = 0; i < AXIS_SAMPLES; i++) sum += analogRead(pin);
+  return (int)(sum / AXIS_SAMPLES);
+}
+
+void calibrateJoystick(){
+  cLX = readAxisAvg(pinJoy_LX);
+  cLY = readAxisAvg(pinJoy_LY);
+  cRX = readAxisAvg(pinJoy_RX);
+  cRY = readAxisAvg(pinJoy_RY);
+
+  Serial.print(F("+JoyStick center: "));
+  Serial.print(cLX); Serial.print(F(", "));
+  Serial.print(cLY); Serial.print(F(", "));
+  Serial.print(cRX); Serial.print(F(", "));
+  Serial.println(cRY);
+}
+
+int axisToStep(int joyPin, int center, int dir){
+  int d = readAxisAvg(joyPin) - center;
+  if (abs(d) <= DEADZONE) return 0;
+
+  int span = (d > 0) ? (1023 - center - DEADZONE) : (center - DEADZONE);
+  if (span < 1) span = 1;
+
+  int mag  = abs(d) - DEADZONE;
+  int step = (int)((long)mag * MAX_STEP / span);
+  if (step < 1) step = 1;
+  if (step > MAX_STEP) step = MAX_STEP;
+
+  return (d > 0 ? step : -step) * dir;
+}
+
+void nudgeServo(Servo &s, int step, int minA, int maxA){
+  if (step == 0) return;
+  int cur = s.read();
+  int to  = cur + step;
+  if (to < minA) to = minA;
+  if (to > maxA) to = maxA;
+  if (to != cur) s.write(to);
+}
+
+void updateJoystick(){
+  if (millis() - lastJoyMs < UPDATE_MS) return;
+  lastJoyMs = millis();
+
+  nudgeServo(base, axisToStep(pinJoy_LX, cLX, DIR_LX), baseMin, baseMax);
+  nudgeServo(rArm, axisToStep(pinJoy_LY, cLY, DIR_LY), rArmMin, rArmMax);
+  nudgeServo(fArm, axisToStep(pinJoy_RY, cRY, DIR_RY), fArmMin, fArmMax);
+  nudgeServo(claw, axisToStep(pinJoy_RX, cRX, DIR_RX), clawMin, clawMax);
+}
+
+
+/* ============================================================================
+ *  【第 15 部分】联调步骤与故障排查（照这个顺序做，一次成功）
+ * ----------------------------------------------------------------------------
+ *  【第一步：先不接按键板，把本板（主控）侧测通】
+ *    1) 只烧这块板子，打开串口监视器（9600）
+ *    2) 敲 1 → 应该执行一次 A 的夹取放置；再敲 1 → 变成 B；再敲 1 → C
+ *    3) 敲 2 → 串口打印 REC START；用摇杆**慢慢、大幅度**地演十几秒，
+ *       再敲 2 → 打印录了多少帧、多少秒
+ *       ★ 现在是 1 秒采一帧，所以"帧数 = 秒数"，一眼就能看出够不够 10 秒。
+ *       ★ 手法要慢：1 秒才采一次，甩得太快中间的过程会被丢掉。
+ *       如果打印 "shorter than 10s"，说明录得太短，重录
+ *    4) 敲 3 → 机械臂把你刚才的动作重演一遍
+ *    5) 敲 4 → 平滑回中
+ *    ★ 这一步全过了，说明你的逻辑没问题，后面出问题一定是硬件/接线。
+ *      （注意：敲单个数字后不用按回车也行，程序有"静默 50ms 自动收尾"。）
+ *
+ *  【第二步：按键板侧单独测】
+ *    1) 烧 uno_keys_check.ino 进第二块 Uno（★ 此时先别接那两根线）
+ *    2) 打开**按键板自己的**串口监视器（9600）
+ *    3) ★ 最省事：发 t 回车，让它带你做接线自检；
+ *       按键没接好它会直接告诉你"哪个键不过、最可能是什么原因"。
+ *       也可以发 w 回车打开实时电平监视，看某个键到底接在哪个 D 号上。
+ *    4) 烧完自检通过后，如果只想要按键功能，也可以改烧
+ *       uno_keys_basic.ino（精简版，没有任何打印，最干净）。
+ *
+ *  【第三步：两块板接起来】
+ *    1) 接线（推荐就用 2 根，最省事、烧录也不受影响）：
+ *          按键板 TX(D1)  ──>  本板 RX(D0)
+ *          按键板 GND      ───  本板 GND     ★ 十有八九的第一次失败都是忘了共地
+ *       可选的第 3 根：本板 TX(D1) ──> 按键板 RX(D0)
+ *          接上以后本板的打印会流回按键板，一个监视器就能看两边；
+ *          ★ 但烧录按键板之前必须把它拔掉（会和 USB 芯片抢线）。
+ *    2) ★ 先在按键板的串口里发 s 回车做联机测试：
+ *       本板的串口监视器上应该出现 5 行 "+LINK OK (from keypad)"。
+ *       ★ 反向线接着的话，这 5 行在按键板自己的监视器里也能看到。
+ *       一行都没有 → 问题一定在"TX->RX 这根线"或"共地"上，与按键无关，
+ *       这样就一步把故障范围缩小到了那 2 根线上。
+ *    3) 再按按键板上的键，本板的串口监视器上应该出现
+ *       "+key: 1" 这样的回显（先回显，再执行动作）
+ *    4) 如果打印的是乱码 → 两边波特率不一致，或者没共地
+ *    5) 如果完全没反应 → 晃动一下那两根线（面包板接触不良是常事），
+ *       注意 TX/RX 别接反了：一定是"按键板 TX → 本板 RX"
+ *
+ *  【★ 一个必须知道的副作用（硬件串口直连的代价）】
+ *    本板 D0/D1 同时也是 USB 口，线上"三方共用"，所以：
+ *      · 你在本板串口监视器里敲 '1'，机械臂会动（这是好事，方便单独测）
+ *      · 你在按键板串口监视器里敲 '1'，机械臂**也会动**
+ *        （因为那根线也接在本板的 RX 上）
+ *      · 按键板打印的调试文字会流进本板，本板把它们当"未知指令"，
+ *        于是回一大堆 Unknown Command —— 看着花，但无害
+ *    演示的时候只看本板这一个监视器，最清楚。
+ *
+ *  【第四步：性能上的一个提醒】
+ *    播放是阻塞式的，播放期间本板收不到新的按键。
+ *    如果考官连按两下按键 2，第二下会在播放**结束之后**才被处理，
+ *    表现为"按了没反应，过几秒突然开始录"。这是可以接受的（有 busy 保护），
+ *    但演示时最好等一下再按下一个键，动作看起来才干净。
+ * ==========================================================================*/

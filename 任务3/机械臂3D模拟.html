@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>机械臂 3D 模拟器 · 任务三（A/B/C 夹取）</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --panel:#ffffff; --line:#d8dce3; --ink:#24292f;
+    --sub:#57606a; --accent:#0969da; --warn:#cf222e; --ok:#1a7f37;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:var(--bg); color:var(--ink);}
+  header{padding:14px 20px 10px; border-bottom:1px solid var(--line); background:var(--panel);}
+  header h1{font-size:18px; font-weight:700;}
+  header p{font-size:12px; color:var(--sub); margin-top:4px; line-height:1.7;}
+  #wrap{display:flex; gap:14px; padding:14px 20px; align-items:flex-start;}
+  #stage{position:sticky; top:14px;}
+  canvas{background:var(--panel); border:1px solid var(--line); border-radius:8px; display:block;}
+  #hud{font-size:12px; color:var(--sub); margin-top:6px; line-height:1.8;}
+  #hud b{color:var(--ink);}
+  #panel{width:330px; flex:none; display:flex; flex-direction:column; gap:10px;}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px;}
+  .card h2{font-size:13px; margin-bottom:8px; color:var(--accent);}
+  .row{display:flex; align-items:center; gap:8px; margin:6px 0; font-size:12px;}
+  .row label{width:118px; color:var(--sub); flex:none;}
+  .row input[type=range]{flex:1;}
+  .row output{width:52px; text-align:right; font-variant-numeric:tabular-nums; flex:none;}
+  .btns{display:flex; gap:6px; flex-wrap:wrap;}
+  button{border:1px solid var(--line); background:#fff; border-radius:6px; padding:6px 12px;
+         font-size:13px; cursor:pointer;}
+  button:hover{border-color:var(--accent); color:var(--accent);}
+  button.run{border-color:var(--accent); color:#fff; background:var(--accent);}
+  button.stop{border-color:var(--warn); color:var(--warn);}
+  .note{font-size:11px; color:var(--sub); line-height:1.7;}
+  .tag{display:inline-block; padding:0 6px; border-radius:4px; font-size:11px; margin-right:6px;}
+  .tA{background:#ddf4ff; color:#0969da;} .tB{background:#fff1c9; color:#9a6700;} .tC{background:#fbefff; color:#8250df;}
+  #wpList{font-size:11px; line-height:1.8; color:var(--sub); max-height:150px; overflow:auto;}
+  #wpList .cur{color:var(--warn); font-weight:700;}
+  fieldset{border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px;}
+  legend{font-size:11px; color:var(--sub); padding:0 4px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>机械臂 3D 模拟器 —— 按实测尺寸建模（任务三 A / B / C 夹取）</h1>
+  <p>
+    建模依据：肘关节离肩关节 8cm、肘关节离地 16cm（r90 时后臂竖直）· 侧面照：尺子 18cm、架顶再高出 2cm（≈20cm，与"肩轴 8cm + 后臂 8cm + 铰接件"吻合）·
+    初始姿态爪尖悬在底盘正上方 · 抓取点 r40/f145 落在桌面。几何映射：后臂 r=90 竖直、减小 r 向后仰（伸后臂把爪拉下来）；前臂 f=90 竖直向下，经摇杆连杆约 1/k 增速外摆。
+    ★ 所有长度和 k_f 都能在右侧调，调到和实物动作对上为止。
+  </p>
+</header>
+
+<div id="wrap">
+  <div id="stage">
+    <canvas id="cv" width="880" height="620"></canvas>
+    <div id="hud">爪尖位置：<b id="hudTip">–</b>　|　当前动作：<b id="hudAct">手动</b></div>
+  </div>
+
+  <div id="panel">
+    <div class="card">
+      <h2>舵机角度（与 Arduino 一致）</h2>
+      <div class="row"><label>底盘 b (0~180)</label><input type="range" id="sB" min="0" max="180" value="90"><output id="oB">90°</output></div>
+      <div class="row"><label>后臂 r (0~120)</label><input type="range" id="sR" min="0" max="120" value="90"><output id="oR">90°</output></div>
+      <div class="row"><label>前臂 f (90~180)</label><input type="range" id="sF" min="90" max="180" value="90"><output id="oF">90°</output></div>
+      <div class="row"><label>夹爪 c (60~120)</label><input type="range" id="sC" min="60" max="120" value="60"><output id="oC">60° 开</output></div>
+      <div class="btns">
+        <button class="run" id="btnA"><span class="tag tA">键1·A</span>夹取放置</button>
+        <button class="run" id="btnB"><span class="tag tB">键1·B</span>夹取放置</button>
+        <button class="run" id="btnC"><span class="tag tC">键1·C</span>夹取放置</button>
+        <button id="btnHome">回中</button>
+        <button class="stop" id="btnStop">停止</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label><input type="checkbox" id="ckTrace" checked> 显示爪尖轨迹</label>
+        <label><input type="checkbox" id="ckBug"> 复现修复前的 B 错位</label>
+      </div>
+      <div class="note">✔ 勾选"复现修复前的 B"可回放旧程序的行为：B 伸出去不松爪，把笔一路夹回原位才突然张开 —— 那就是"乱甩 + 没停稳就张爪"的来源。</div>
+    </div>
+
+    <div class="card">
+      <h2>连杆尺寸（cm，按实物调）</h2>
+      <div class="row"><label>肩轴高 H</label><input type="range" id="dH" min="4" max="16" step="0.5" value="8"><output id="oH">8.0</output></div>
+      <div class="row"><label>后臂 肩→肘 Lr</label><input type="range" id="dLr" min="5" max="14" step="0.5" value="8"><output id="oLr">8.0</output></div>
+      <div class="row"><label>前臂 肘→爪 Lf</label><input type="range" id="dLf" min="5" max="16" step="0.5" value="8.5"><output id="oLf">8.5</output></div>
+      <div class="row"><label>夹爪长 Lc</label><input type="range" id="dLc" min="2" max="6" step="0.5" value="3.5"><output id="oLc">3.5</output></div>
+      <div class="row"><label>前臂连杆比 k_f</label><input type="range" id="dKf" min="0.2" max="0.8" step="0.02" value="0.42"><output id="oKf">0.42</output></div>
+      <div class="row"><label>放置高度 PLACE_R</label><input type="range" id="dPr" min="30" max="90" step="1" value="45"><output id="oPr">45°</output></div>
+      <div class="note">k_f：前臂舵机经摇杆连杆折算的角速度比（f=90 竖直向下；φ = −90 + (f−90)·k_f）。<br>
+        尺子参照：图里立着一把 18cm 的尺，虚线再往上 2cm —— 臂架顶部 ≈20cm。</div>
+    </div>
+
+    <div class="card">
+      <h2>航路点（与 .ino 同步）</h2>
+      <div id="wpList"></div>
+    </div>
+
+    <div class="card note">
+      <h2 style="color:var(--warn)">本次修的两个问题</h2>
+      ① <b>B 的张爪点挂错了</b>：旧程序 ACT_REL 在第 8 点（复位点），B 把笔夹回原位才张爪 → 点 7 不松、回程乱甩、到家门口突然张爪。已改到第 7 点。<br>
+      ② <b>放置点太高 / 没停稳就张爪</b>：B、C 放置原来用 r90，爪尖悬空 4~5cm；现在放置点先"伸后臂"降到 PLACE_R 再松爪；且每次合爪/张爪前先等 400ms 让手臂彻底停稳（ARM_SETTLE_MS）。
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 几何模型（cm） =================
+ *  世界坐标：X 前（b=90 朝向）、Y 左、Z 上；底盘轴在原点。
+ *  后臂：r=90 竖直向上，r 减小向后仰  θr = (90 - r)°
+ *        肘 = 肩 + Lr·(-sinθr, cosθr)               → r40 肘在轴后上方
+ *  前臂：φ = -90 + (f - 90)·k_f  （f=90 竖直向下）
+ *        爪轴 = 肘 + Lf·(cosφ, sinφ)；爪尖再顺 φ 伸 Lc
+ *  底盘：ψ = (b - 90)°，整个臂平面绕竖直轴转 ψ。            */
+const P = { H:8, Lr:8, Lf:8.5, Lc:3.5, kf:0.42, placeR:45 };
+const ang = d => d*Math.PI/180;
+
+function fk(b,r,f,c){
+  const th = ang(90-r), phi = ang(-90 + (f-90)*P.kf);
+  const ex = -P.Lr*Math.sin(th), ez = P.H + P.Lr*Math.cos(th);      // 肘（局部 x-z）
+  const px = ex + P.Lf*Math.cos(phi), pz = ez + P.Lf*Math.sin(phi); // 爪轴
+  const tx = px + P.Lc*Math.cos(phi), tz = pz + P.Lc*Math.sin(phi); // 爪尖
+  const ps = ang(b-90), cs = Math.cos(ps), sn = Math.sin(ps);
+  const w = p => ({x:p.x*cs, y:p.x*sn, z:p.z});
+  return { elbow:w({x:ex,z:ez}), pivot:w({x:px,z:pz}), tip:w({x:tx,z:tz}),
+           phi, th, ps, localTip:{x:tx,z:tz} };
+}
+
+/* ================= 航路点表（与 task3_arduino.ino 完全一致） ================= */
+const PLACE_R = () => P.placeR;
+const WP_RAW = [
+  [ /* A */
+    {b:90,r:90,f:90},{b:60,r:90,f:90},{b:60,r:40,f:90},{b:60,r:40,f:145},
+    {b:60,r:40,f:145},{b:60,r:40,f:90},{b:60,r:90,f:90},{b:90,r:90,f:90},
+    {b:90,r:40,f:90},{b:90,r:40,f:135} ],
+  [ /* B */
+    {b:90,r:90,f:90},{b:120,r:90,f:90},{b:120,r:40,f:90},{b:120,r:40,f:100},
+    {b:120,r:40,f:90},{b:120,r:90,f:90},{b:100,r:90,f:90},
+    {b:100,r:-1,f:130},{b:90,r:90,f:90} ],          // r=-1 → PLACE_R
+  [ /* C */
+    {b:90,r:90,f:90},{b:70,r:90,f:90},{b:70,r:40,f:90},{b:70,r:40,f:145},
+    {b:70,r:40,f:90},{b:70,r:90,f:90},{b:95,r:90,f:90},
+    {b:95,r:-1,f:135},{b:90,r:90,f:90},{b:90,r:90,f:90} ]
+];
+const ACT = { NONE:0, GRIP:1, HOLD:2, REL:3 };
+function actTable(obj){
+  if (obj===0) return [0,0,0,ACT.GRIP,ACT.HOLD,0,0,0,0,ACT.REL];
+  if (obj===1){
+    // 修复前：REL 挂在点8；修复后：点7
+    return document.getElementById('ckBug').checked
+      ? [0,0,0,ACT.GRIP,0,0,0,0,ACT.REL,0]
+      : [0,0,0,ACT.GRIP,0,0,0,ACT.REL,0,0];
+  }
+  return [0,0,0,ACT.GRIP,0,0,0,ACT.REL,0,0];
+}
+const WP_CNT = [10,9,9];
+
+/* ================= 视图 / 相机 ================= */
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const cam = { a: 32, p: 18, d: 62 };                 // 方位角/俯角/距离（cm）
+function project(X,Y,Z){
+  const a=ang(cam.a), p=ang(cam.p);
+  const x1 = X*Math.cos(a) - Y*Math.sin(a);
+  const y1 = X*Math.sin(a) + Y*Math.cos(a);          // 深度
+  const z2 = Z*Math.cos(p) - y1*Math.sin(p);
+  const d2 = y1*Math.cos(p) + Z*Math.sin(p) + cam.d;
+  const s = cv.width/2 * 46/d2;                      // 弱透视
+  return { x: cv.width/2 + x1*s, y: cv.height*0.62 - z2*s, s, depth:d2 };
+}
+function line3(p1,p2,wid,color,dash){
+  const a=project(p1.x,p1.y,p1.z), b=project(p2.x,p2.y,p2.z);
+  ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=Math.max(1.5,wid*a.s);
+  ctx.lineCap='round'; if(dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
+}
+function ball(p,rad,color){
+  const a=project(p.x,p.y,p.z);
+  ctx.save(); ctx.fillStyle=color; ctx.beginPath();
+  ctx.arc(a.x,a.y,Math.max(2,rad*a.s),0,7); ctx.fill(); ctx.restore();
+}
+function label(p,txt,color,dy){
+  const a=project(p.x,p.y,p.z);
+  ctx.save(); ctx.fillStyle=color; ctx.font='11px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(txt,a.x,a.y+(dy||-10)); ctx.restore();
+}
+
+/* ================= 绘制 ================= */
+let trace = [];
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const o = project(0,0,0);
+  /* ---- 地面网格 1cm ---- */
+  ctx.save(); ctx.strokeStyle='#e3e7ee'; ctx.lineWidth=1;
+  for(let i=-20;i<=14;i++){
+    line3({x:i,y:-20,z:0},{x:i,y:20,z:0},1,'#e3e7ee');
+    line3({x:-20,y:i,z:0},{x:20,y:i,z:0},1,'#e3e7ee');
+  }
+  line3({x:0,y:-20,z:0},{x:0,y:20,z:0},1,'#c9d2de');          // 底盘轴线
+  /* ---- 前/后壁 ---- */
+  line3({x:13.5,y:-20,z:0},{x:13.5,y:20,z:0},2,'#f0c6c6');
+  label({x:13.5,y:16,z:0},'前壁 15cm','#b62324',14);
+  line3({x:-19.5,y:-20,z:0},{x:-19.5,y:20,z:0},2,'#f0c6c6');
+  label({x:-19.5,y:16,z:0},'后壁 18cm','#b62324',14);
+  /* ---- 尺子参照（18cm + 2cm） ---- */
+  const rx=-13, ry=8;
+  ctx.save(); ctx.fillStyle='#fdf6d8'; ctx.strokeStyle='#c9b458';
+  let r0=project(rx,ry,0), r1=project(rx,ry,18);
+  ctx.beginPath(); ctx.rect(r0.x-7,r1.y,14,r0.y-r1.y); ctx.fill(); ctx.stroke();
+  for(let h=0;h<=18;h+=1){
+    const a=project(rx,ry,h), b=project(rx+ (h%5?0.5:1),ry,h);
+    ctx.beginPath(); ctx.moveTo(a.x-0,a.y); ctx.lineTo(project(rx+(h%5?0.6:1.1),ry,h).x,a.y);
+    ctx.strokeStyle='#a08a2c'; ctx.stroke();
+  }
+  ctx.fillStyle='#7a6a1e'; ctx.font='10px sans-serif'; ctx.textAlign='left';
+  ctx.fillText('18cm 尺',r1.x+10,r1.y+4);
+  ctx.restore();
+  line3({x:rx,y:ry,z:18},{x:rx,y:ry,z:20},1.5,'#b62324',[3,3]);
+  label({x:rx,y:ry,z:20.4},'+2cm → 架顶≈20','#b62324',-4);
+  ctx.restore();
+
+  /* ---- 底盘 ---- */
+  const b = readUI();
+  const k = fk(b.b,b.r,b.f,b.c);
+  const ps=k.ps, cs=Math.cos(ps), sn=Math.sin(ps);
+  // 底座盒
+  drawBox(-4,4,-2.2,2.2,7.2,'#454b57');       // 底座箱（局部 x -4~4）
+  drawBox(-2.4,2.4,-1.6,1.6,2.2,'#5b6472',7.2); // 台上小座
+  // 肩到肘（后臂，双杆画法）
+  const S={x:0,y:0,z:P.H}, E=k.elbow;
+  line3(S,E,3.2,'#2f5faf');
+  // 平行连杆（视觉）
+  const off={x:Math.sin(k.ps)*0.9, y:-Math.cos(k.ps)*0.9, z:0};
+  line3({x:S.x-off.x,y:S.y-off.y,z:S.z},{x:E.x-off.x,y:E.y-off.y,z:E.z},1.6,'#8aa4d6');
+  ball(S,2.6,'#24292f'); label(S,'肩','#57606a');
+  ball(E,2.2,'#24292f'); label(E,'肘','#57606a');
+  // 肘到爪轴（前臂）
+  line3(E,k.pivot,2.8,'#c9532f');
+  ball(k.pivot,1.9,'#24292f');
+  // 爪（两指，随 c 开合）
+  drawClaw(k, b.c);
+  ball(k.tip,1.6,'#cf222e'); label(k.tip,'爪尖','#cf222e',-8);
+  // 轨迹
+  if(document.getElementById('ckTrace').checked){
+    ctx.save(); ctx.strokeStyle='rgba(207,34,46,.55)'; ctx.lineWidth=1.4; ctx.beginPath();
+    for(let i=0;i<trace.length;i++){
+      const a=project(trace[i].x,trace[i].y,trace[i].z);
+      i?ctx.lineTo(a.x,a.y):ctx.moveTo(a.x,a.y);
+    } ctx.stroke(); ctx.restore();
+  }
+  // 爪尖读数
+  const fwd = k.tip.x*cs + k.tip.y*sn;             // 沿 b=90 朝向的前后分量
+  document.getElementById('hudTip').textContent =
+    `高度 ${k.tip.z.toFixed(1)} cm，底盘轴${fwd>=0?'前':'后'} ${Math.abs(fwd).toFixed(1)} cm` +
+    `（φ前臂 ${(k.phi*180/Math.PI).toFixed(0)}°）`;
+  requestAnimationFrame(draw);
+}
+function drawBox(x0,x1,y0,y1,h,color,z0=0){
+  const v=[[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+  const bot=v.map(p=>project(p[0],p[1],z0)), top=v.map(p=>project(p[0],p[1],z0+h));
+  ctx.save(); ctx.fillStyle=color; ctx.strokeStyle='#2b3038'; ctx.lineWidth=1;
+  ctx.beginPath(); top.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.fill(); ctx.stroke();
+  for(let i=0;i<4;i++){ ctx.beginPath(); ctx.moveTo(bot[i].x,bot[i].y); ctx.lineTo(top[i].x,top[i].y); ctx.stroke(); }
+  ctx.beginPath(); bot.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.stroke();
+  ctx.restore();
+}
+function drawClaw(k,c){
+  const open = 1 - (c-60)/60;                       // 60 开→1，120 闭→0
+  const spread = ang(4 + open*16);
+  const dir = {x:Math.cos(k.phi), z:Math.sin(k.phi)};
+  const perp = {x:-dir.z, z:dir.x};
+  const L=P.Lc;
+  const f1={x:k.pivot.x+dir.x*L*0.9+perp.x*L*0.28*Math.sin(spread*3),
+            y:k.pivot.y, z:k.pivot.z+dir.z*L*0.9+perp.z*L*0.28*Math.sin(spread*3)};
+  const f2={x:k.pivot.x+dir.x*L*0.9-perp.x*L*0.28*Math.sin(spread*3),
+            y:k.pivot.y, z:k.pivot.z+dir.z*L*0.9-perp.z*L*0.28*Math.sin(spread*3)};
+  const ps=k.ps, cs=Math.cos(ps), sn=Math.sin(ps);
+  const w=p=>({x:p.x*cs,y:p.x*sn,z:p.z});
+  line3(k.pivot,w(f1),2,'#cf222e'); line3(k.pivot,w(f2),2,'#cf222e');
+}
+
+/* ================= UI 读写 ================= */
+function bind(id,out,fmt,fn){
+  const el=document.getElementById(id), o=document.getElementById(out);
+  const upd=()=>{ const v=parseFloat(el.value); o.textContent=fmt(v); fn(v); };
+  el.addEventListener('input',upd); upd();
+}
+const dim = {};
+bind('dH','oH',v=>v.toFixed(1),v=>{P.H=v; dim.H=v;});
+bind('dLr','oLr',v=>v.toFixed(1),v=>{P.Lr=v; dim.Lr=v;});
+bind('dLf','oLf',v=>v.toFixed(1),v=>{P.Lf=v;});
+bind('dLc','oLc',v=>v.toFixed(1),v=>{P.Lc=v;});
+bind('dKf','oKf',v=>v.toFixed(2),v=>{P.kf=v;});
+bind('dPr','oPr',v=>v+'°',v=>{P.placeR=v;});
+function readUI(){
+  return { b:+sB.value, r:+sR.value, f:+sF.value, c:+sC.value };
+}
+[['sB','oB',v=>v+'°'],['sR','oR',v=>v+'°'],['sF','oF',v=>v+'°'],
+ ['sC','oC',v=>v+'° '+(v<90?'开':'合')]].forEach(([i,o,fm])=>{
+  const el=document.getElementById(i), oo=document.getElementById(o);
+  el.addEventListener('input',()=>oo.textContent=fm(+el.value));
+});
+
+/* ================= 回放引擎（模拟 Arduino 的时序） ================= */
+let stopFlag=false, playing=false;
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+function setServo(b,r,f,c){ sB.value=b; sR.value=r; sF.value=f; sC.value=c;
+  oB.textContent=b+'°'; oR.textContent=r+'°'; oF.textContent=f+'°';
+  oC.textContent=c+'° '+(c<90?'开':'合'); }
+async function syncMoveTo(t1,t2,stepMs=20){
+  let {b,r,f}=readUI();
+  const steps=Math.max(Math.abs(t1.b-b),Math.abs(t1.r-r),Math.abs(t1.f-f));
+  for(let i=1;i<=steps && !stopFlag;i++){
+    setServo(b+(t1.b-b)*i/steps, r+(t1.r-r)*i/steps, f+(t1.f-f)*i/steps, readUI().c);
+    await sleep(stepMs);
+  }
+}
+async function moveToPose(t){
+  const cur=readUI();
+  if(t.b!==cur.b && (cur.r<90 || cur.f>110)){        // 安全前置（SAFE_R=90/SAFE_F=110）
+    hudAct('安全抬臂'); 
+    await syncMoveTo({b:cur.b,r:Math.max(cur.r,90),f:Math.min(cur.f,110)});
+  }
+  await syncMoveTo(t);
+}
+function hudAct(s){ document.getElementById('hudAct').textContent=s; }
+function showWP(obj,i,t){
+  document.getElementById('wpList').innerHTML = WP_RAW[obj].map((p,j)=>
+    `<div class="${j===i?'cur':''}">${'ABC'[obj]}·点${j}  b${p.b<0?'PLACE_R':p.b} / r${p.r<0?P.placeR:p.r} / f${p.f}</div>`).join('');
+}
+async function runTask(obj){
+  if(playing) return; playing=true; stopFlag=false; trace=[];
+  hudAct(`夹取 ${'ABC'[obj]}`);
+  setServo(readUI().b,readUI().r,readUI().f,60);     // 先张爪
+  const acts=actTable(obj), n=WP_CNT[obj];
+  for(let i=0;i<n && !stopFlag;i++){
+    let wp={...WP_RAW[obj][i]};
+    if(wp.r<0) wp.r=P.placeR;                        // PLACE_R
+    showWP(obj,i,wp);
+    await moveToPose(wp);
+    if(stopFlag) break;
+    const a=acts[i];
+    if(a===ACT.GRIP){ hudAct('停稳 400ms → 合爪');
+      await sleep(400); setServo(readUI().b,readUI().r,readUI().f,120);
+      hudAct('夹稳 300ms'); await sleep(300); }
+    else if(a===ACT.HOLD){ await sleep(300); }
+    else if(a===ACT.REL){ hudAct('停稳 400ms → 张爪');
+      await sleep(400); setServo(readUI().b,readUI().r,readUI().f,60);
+      await sleep(150); }
+    else await sleep(60);
+  }
+  showWP(obj,-1);
+  hudAct(stopFlag?'已停止':'完成'); playing=false;
+}
+document.getElementById('btnA').onclick=()=>runTask(0);
+document.getElementById('btnB').onclick=()=>runTask(1);
+document.getElementById('btnC').onclick=()=>runTask(2);
+document.getElementById('btnHome').onclick=async()=>{ if(playing)return;
+  playing=true; stopFlag=false; hudAct('回中'); await moveToPose({b:90,r:90,f:90});
+  setServo(90,90,90,60); hudAct('完成'); playing=false; };
+document.getElementById('btnStop').onclick=()=>{ stopFlag=true; };
+
+/* 每帧记录爪尖轨迹 */
+setInterval(()=>{ const b=readUI(); const k=fk(b.b,b.r,b.f,b.c);
+  if(!playing || !stopFlag) trace.push(k.tip);
+  if(trace.length>1200) trace.shift(); }, 60);
+
+/* 鼠标轨道 */
+let drag=null;
+cv.addEventListener('mousedown',e=>drag={x:e.clientX,y:e.clientY,a:cam.a,p:cam.p});
+window.addEventListener('mousemove',e=>{ if(!drag)return;
+  cam.a=drag.a+(e.clientX-drag.x)*0.4; cam.p=Math.max(2,Math.min(70,drag.p+(e.clientY-drag.y)*0.3)); });
+window.addEventListener('mouseup',()=>drag=null);
+cv.addEventListener('wheel',e=>{ e.preventDefault();
+  cam.d=Math.max(30,Math.min(120,cam.d+e.deltaY*0.05)); },{passive:false});
+
+showWP(0,-1);
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
